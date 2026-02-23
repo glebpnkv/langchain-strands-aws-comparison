@@ -1,14 +1,14 @@
 # langchain-strands-aws-comparison
 Comparison of LangChain and Strands along the following dimensions (✅: implemented):
 
-| Dimension                    | LangChain (Deep Agents)                                                | Strands                                                        | Notes (AWS Bedrock / on-prem)                                                                     |
-| ---------------------------- | ---------------------------------------------------------------------- |----------------------------------------------------------------| ------------------------------------------------------------------------------------------------- |
-| Bedrock LLM support          | `langchain-aws` Bedrock chat models                                    | Bedrock is default model provider (✅)                          | Both solid for Bedrock-centric stacks ([docs.langchain.com][1])                                   |
-| Out-of-box agent             | `create_deep_agent()` strong baseline                                  | `Agent()` minimal baseline; add tools (✅)                      | Deep Agents feels more “batteries included” by default ([GitHub][3])                              |
-| MCP support                  | Not MCP-first in Deep Agents surface (expect glue/adapter)             | First-class MCP client + tools (✅)                             | Strands has an official “few lines” MCP example ([strandsagents.com][4])                          |
-| Sandboxed code exec          | AgentCore Code Interpreter toolkit in `langchain-aws`                  | AgentCore Code Interpreter tool listed in community tools (✅)  | Both can align on managed sandboxing via AgentCore ([docs.langchain.com][5])                      |
-| AWS integrations breadth     | Very broad AWS integration catalog                                     | Growing AWS-aligned tool ecosystem (✅)                         | LangChain’s AWS surface area is notably larger today ([docs.langchain.com][5])                    |
-| Observability posture        | Strong ecosystem; common tracing/eval tooling                          | Built-in instrumentation + telemetry (OTel-friendly) (✅)       | If OTel everywhere is a hard requirement, Strands may be simpler ([Amazon Web Services, Inc.][9]) |
+| Dimension                    | LangChain (Deep Agents)                                                   | Strands                                                        | Notes (AWS Bedrock / on-prem)                                                                     |
+| ---------------------------- |---------------------------------------------------------------------------|----------------------------------------------------------------| ------------------------------------------------------------------------------------------------- |
+| Bedrock LLM support          | `langchain-aws` Bedrock chat models (✅)                                   | Bedrock is default model provider (✅)                          | Both solid for Bedrock-centric stacks ([docs.langchain.com][1])                                   |
+| Out-of-box agent             | `create_deep_agent()` strong baseline (✅)                                 | `Agent()` minimal baseline; add tools (✅)                      | Deep Agents feels more “batteries included” by default ([GitHub][3])                              |
+| MCP support                  | Not MCP-first in Deep Agents surface, but good adapter (✅)                | First-class MCP client + tools (✅)                             | Strands has an official “few lines” MCP example ([strandsagents.com][4])                          |
+| Sandboxed code exec          | ~~AgentCore Code Interpreter toolkit in `langchain-aws`~~ Daytona for now | AgentCore Code Interpreter tool listed in community tools (✅)  | Both can align on managed sandboxing via AgentCore ([docs.langchain.com][5])                      |
+| AWS integrations breadth     | Very broad AWS integration catalog                                        | Growing AWS-aligned tool ecosystem (✅)                         | LangChain’s AWS surface area is notably larger today ([docs.langchain.com][5])                    |
+| Observability posture        | Strong ecosystem; common tracing/eval tooling                             | Built-in instrumentation + telemetry (OTel-friendly) (✅)       | If OTel everywhere is a hard requirement, Strands may be simpler ([Amazon Web Services, Inc.][9]) |
 
 [1]: https://docs.langchain.com/oss/python/integrations/chat/bedrock?utm_source=chatgpt.com "ChatBedrock - Docs by LangChain"
 [2]: https://reference.langchain.com/python/integrations/langchain_openai/ChatOpenAI/?utm_source=chatgpt.com "ChatOpenAI | LangChain Reference"
@@ -53,4 +53,23 @@ From the root directory:
 source .venv/bin/activate
 aws sso login
 python agents/strands-agent/main.py
+```
+
+## Running `langchain-agent`
+Set up environment variables:
+```bash
+cp agents/langchain-agent/.env.template agents/langchain-agent/.env
+# Edit agents/langchain-agent/.env with your configuration
+```
+
+If you use Daytona backend, make sure to add `DAYTONA_API_KEY` to `.env`, then run:
+```bash
+source .venv/bin/activate
+aws sso login
+python agents/langchain-agent/main.py
+```
+
+Optional: list Athena MCP tools before running:
+```bash
+python agents/langchain-agent/main.py --list-tools
 ```
