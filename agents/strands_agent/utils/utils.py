@@ -1,12 +1,10 @@
 import ast
 import logging
 from pathlib import Path
-from typing import Any
-from strands_tools.code_interpreter import AgentCoreCodeInterpreter
-from strands_tools.code_interpreter.models import (
-    ExecuteCommandAction,
-    ReadFilesAction,
-)
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from strands_tools.code_interpreter import AgentCoreCodeInterpreter
 
 def _json_default(o):
     try:
@@ -29,7 +27,7 @@ def extract_text(response: Any) -> str:
 
 
 def extract_artifacts_from_sandbox(
-    code_interpreter_tool: AgentCoreCodeInterpreter,
+    code_interpreter_tool: "AgentCoreCodeInterpreter",
     ci_session_name: str,
     artifacts_dir: Path,
 ) -> None:
@@ -42,8 +40,8 @@ def extract_artifacts_from_sandbox(
         artifacts_dir: Local directory to save artifacts to
     """
     logger = logging.getLogger(__name__)
-    # logger.info(f"Extracting artifacts from sandbox session '{ci_session_name}' to {artifacts_dir}")
-    print(f"Extracting artifacts from sandbox session '{ci_session_name}' to {artifacts_dir}")
+    logger.info(f"Extracting artifacts from sandbox session '{ci_session_name}' to {artifacts_dir}")
+    from strands_tools.code_interpreter.models import ExecuteCommandAction, ReadFilesAction
 
     try:
         # 1. Discover all files in the sandbox

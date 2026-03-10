@@ -33,6 +33,17 @@ Login to your AWS account using SSO:
 ```bash
 aws sso login
 ```
+### LibreChat setup (one-time)
+Run the setup script once from the repository root:
+```bash
+./scripts/setup_librechat.sh
+```
+
+Then manually edit `vendor/LibreChat/.env` and set:
+```bash
+BEDROCK_AWS_DEFAULT_REGION=eu-central-1
+```
+
 ### Uploading data sample to Athena
 Run `upload_iris_data.py` to upload a sample Iris dataset to Athena in your AWS account:
 ```bash
@@ -72,4 +83,58 @@ python agents/langchain-agent/main.py
 Optional: list Athena MCP tools before running:
 ```bash
 python agents/langchain-agent/main.py --list-tools
+```
+
+## Running `LibreChat`
+
+```bash
+cd vendor/LibreChat
+docker compose up -d && docker compose logs -f api
+```
+
+## Running LibreChat with Deployed AgentCore Runtime
+
+Start the local OpenAI-compatible adapter (from repo root) in one terminal:
+
+```bash
+./scripts/start_agentcore_openai_adapter.sh
+```
+
+Then start LibreChat in a second terminal:
+
+```bash
+cd vendor/LibreChat
+docker compose up -d && docker compose logs -f api
+```
+
+In the LibreChat model picker, select `Strands AgentCore Runtime`.
+
+Notes:
+- Adapter URL configured in `vendor/LibreChat/librechat.yaml`: `http://host.docker.internal:8800/v1`
+- Runtime ARN is auto-read from `agents/strands_agent/.bedrock_agentcore.yaml`
+- Adapter API key defaults to `agentcore-local` (matches LibreChat custom endpoint config)
+- Override runtime ARN manually if needed:
+  - `AGENT_RUNTIME_ARN=arn:aws:bedrock-agentcore:... ./scripts/start_agentcore_openai_adapter.sh`
+
+### One-command startup (adapter + LibreChat)
+
+You can run both the adapter and LibreChat with one script:
+
+```bash
+./scripts/librechat_agentcore_stack.sh up
+```
+
+Useful commands:
+
+```bash
+./scripts/librechat_agentcore_stack.sh start     # start both, no log follow
+./scripts/librechat_agentcore_stack.sh status    # health + docker compose ps
+./scripts/librechat_agentcore_stack.sh logs      # follow LibreChat api logs
+./scripts/librechat_agentcore_stack.sh down      # stop LibreChat + adapter
+```
+
+If you only want to start services without log follow:
+
+```bash
+./scripts/librechat_agentcore_stack.sh up --no-follow
 ```

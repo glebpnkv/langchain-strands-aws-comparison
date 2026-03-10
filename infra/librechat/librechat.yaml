@@ -1,0 +1,53 @@
+version: 1.3.5
+cache: true
+
+interface:
+  modelSelect: true
+  endpointsMenu: true
+  parameters: true
+  presets: true
+
+endpoints:
+  bedrock:
+    titleModel: "current_model"
+    availableRegions:
+      - "eu-west-1"
+    models:
+      - "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+  custom:
+    - name: "agentcore-runtime"
+      apiKey: "agentcore-local"
+      baseURL: "http://host.docker.internal:8800/v1"
+      models:
+        default:
+          - "agentcore-runtime"
+        fetch: false
+      titleConvo: false
+      modelDisplayLabel: "AgentCore Runtime"
+
+  agents:
+    disableBuilder: false
+    allowedProviders:
+      - "bedrock"
+      - "agentcore-runtime"
+
+modelSpecs:
+  prioritize: true
+  list:
+    - name: "strands-agentcore-runtime"
+      label: "Strands AgentCore Runtime"
+      description: "Proxy to Bedrock AgentCore runtime via local OpenAI-compatible adapter"
+      group: "agentcore-runtime"
+      preset:
+        endpoint: "agentcore-runtime"
+        model: "agentcore-runtime"
+        modelLabel: "Strands AgentCore Runtime"
+
+    - name: "bedrock-claude-haiku-4-5-eu"
+      label: "Bedrock Claude Haiku 4.5 EU"
+      group: "bedrock"
+      preset:
+        endpoint: "bedrock"
+        model: "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
+        modelLabel: "Bedrock Claude Haiku 4.5 EU"

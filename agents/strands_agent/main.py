@@ -191,7 +191,7 @@ def make_agent(
     model_id: str,
     database: str,
     mcp_client: MCPClient
-) -> Agent:
+) -> tuple[Agent, str, AgentCoreCodeInterpreter]:
     """
     Create a Strands Agent instance with specified configuration.
 
@@ -205,8 +205,8 @@ def make_agent(
         model_id=model_id,
     )
 
-    # Initialise AgentCoreCodeInterpreter with explicit session_name: host-side write_files and agent-side code_interpreter
-    # hit the same sandbox session
+    # Initialise AgentCoreCodeInterpreter with explicit session_name: host-side write_files and agent-side
+    # code_interpreter hit the same sandbox session
     ci_session_name = f"iris-{uuid.uuid4().hex[:10]}"
     code_interpreter_tool = AgentCoreCodeInterpreter(
         region=region,
