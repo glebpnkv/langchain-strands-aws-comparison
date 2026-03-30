@@ -2,9 +2,7 @@ import argparse
 import json
 import logging
 import os
-import re
 import sys
-import time
 import uuid
 from datetime import datetime
 from os import linesep
@@ -12,22 +10,16 @@ from pathlib import Path
 from typing import Tuple
 
 import boto3
-import pandas as pd
 from dotenv import load_dotenv
 from mcp import stdio_client, StdioServerParameters
 from strands import Agent
-from strands import tool
 from strands.models import BedrockModel
 from strands.telemetry import StrandsTelemetry
 from strands.tools.mcp import MCPClient
 from strands_tools.code_interpreter import AgentCoreCodeInterpreter
-from strands_tools.code_interpreter.models import (
-    FileContent,
-    ListFilesAction,
-    WriteFilesAction,
-)
 
 from utils.prompts import SYSTEM_PROMPT
+from utils.tools import make_athena_query_to_ci_csv
 from utils.utils import _json_default, extract_text, extract_artifacts_from_sandbox
 
 load_dotenv()
@@ -213,139 +205,13 @@ def make_agent(
         session_name=ci_session_name,
     )
 
-    @tool
-    def athena_query_to_ci_csv(
-        sql: str,
-        sandbox_path: str = "data/iris_query.csv",
-        poll_seconds: float = 0.5,
-        timeout_seconds: int = 60,
-    ) -> str:
-        """
-        Execute a read-only Athena query and upload the result as CSV into the AgentCore Code Interpreter sandbox.
-        Uses boto3 Athena APIs directly (compatible with Athena managed query results workgroups).
-        """
-        raw_sql = (sql or "").strip().rstrip(";")
-        if not raw_sql:
-            return json.dumps({"ok": False, "error": "Empty SQL"})
-
-        if not re.match(r"(?is)^\s*(select|with)\b", raw_sql):
-            return json.dumps({"ok": False, "error": "Only read-only SELECT/WITH queries are allowed."})
-
-        wrapped_sql = f"SELECT * FROM ({raw_sql}) AS t"
-
-        athena = session.client("athena", region_name=region)
-
-        try:
-            # IMPORTANT: no ResultConfiguration here (managed query results workgroup compatibility)
-            start = athena.start_query_execution(
-                QueryString=wrapped_sql,
-                QueryExecutionContext={"Database": database, "Catalog": "AwsDataCatalog"},
-                WorkGroup="primary",
-            )
-            qid = start["QueryExecutionId"]
-
-            # Poll
-            deadline = time.time() + timeout_seconds
-            state = "QUEUED"
-            reason = None
-            while time.time() < deadline:
-                q = athena.get_query_execution(QueryExecutionId=qid)
-                status = q["QueryExecution"]["Status"]
-                state = status["State"]
-                reason = status.get("StateChangeReason")
-                if state in {"SUCCEEDED", "FAILED", "CANCELLED"}:
-                    break
-                time.sleep(poll_seconds)
-
-            if state != "SUCCEEDED":
-                return json.dumps({
-                    "ok": False,
-                    "error": f"Athena query {state}",
-                    "reason": reason,
-                    "query_execution_id": qid,
-                    "sql_attempted": wrapped_sql,
-                    "database": database,
-                    "workgroup": "primary",
-                })
-
-            # Fetch paginated rows
-            rows = []
-            next_token = None
-            col_names = None
-
-            while True:
-                kwargs = {"QueryExecutionId": qid, "MaxResults": 1000}
-                if next_token:
-                    kwargs["NextToken"] = next_token
-                resp = athena.get_query_results(**kwargs)
-
-                result_set = resp["ResultSet"]
-                metadata = result_set["ResultSetMetadata"]["ColumnInfo"]
-                if col_names is None:
-                    col_names = [c["Name"] for c in metadata]
-
-                page_rows = result_set.get("Rows", [])
-
-                # First row of first page is header in GetQueryResults
-                if page_rows:
-                    start_idx = 1 if not rows else 0
-                    for r in page_rows[start_idx:]:
-                        data = r.get("Data", [])
-                        vals = [cell.get("VarCharValue") if i < len(data) else None for i, cell in enumerate(data)]
-                        # Normalize row length
-                        if len(vals) < len(col_names):
-                            vals += [None] * (len(col_names) - len(vals))
-                        rows.append(vals[: len(col_names)])
-
-                next_token = resp.get("NextToken")
-                if not next_token:
-                    break
-
-            df = pd.DataFrame(rows, columns=col_names)
-
-            # Optional light type casting for nicer downstream plotting (safe best effort)
-            for c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="ignore")
-
-            csv_text = df.to_csv(index=False)
-
-            write_result = code_interpreter_tool.write_files(
-                WriteFilesAction(
-                    type="writeFiles",
-                    content=[FileContent(path=sandbox_path, text=csv_text)],
-                )
-            )
-
-            list_result = code_interpreter_tool.list_files(
-                ListFilesAction(
-                    type="listFiles",
-                    path=str(Path(sandbox_path).parent),
-                )
-            )
-
-            return json.dumps({
-                "ok": True,
-                "query_execution_id": qid,
-                "database": database,
-                "workgroup": "primary",
-                "sql_executed": wrapped_sql,
-                "sandbox_path": sandbox_path,
-                "rows": int(len(df)),
-                "columns": list(df.columns),
-                "preview_rows": df.head(5).to_dict(orient="records"),
-                "ci_session_name": ci_session_name,
-                "write_result": write_result,
-                "list_result": list_result,
-            }, default=str)
-
-        except Exception as e:
-            return json.dumps({
-                "ok": False,
-                "error": str(e),
-                "sql_attempted": wrapped_sql,
-                "database": database,
-                "workgroup": "primary",
-            })
+    athena_query_to_ci_csv = make_athena_query_to_ci_csv(
+        session=session,
+        region=region,
+        database=database,
+        code_interpreter_tool=code_interpreter_tool,
+        ci_session_name=ci_session_name,
+    )
 
     agent = Agent(
         model=model,
@@ -432,7 +298,22 @@ Please:
 - return concise analysis with SQL used.
 """.strip()
 
-        result = agent(task)
+        try:
+            result = agent(task)
+        except Exception as e:
+            final_text = (
+                "Plan:\n"
+                "- Report the tool failure.\n"
+                "- Explain the likely AWS/MCP configuration issue.\n"
+                "- Continue with best-effort guidance.\n\n"
+                f"I hit a tool failure: {e}\n"
+                "Likely AWS configuration issue: verify AWS_PROFILE/AWS_REGION, run `aws sso login`, "
+                "and confirm the Athena MCP server is available."
+            )
+            print(final_text, flush=True)
+            (run_dir / "final_answer.txt").write_text(final_text, encoding="utf-8")
+            (run_dir / "agent_error.txt").write_text(str(e), encoding="utf-8")
+            return 0
 
         # Human-readable answer
         final_text = extract_text(result)
@@ -465,6 +346,7 @@ Please:
             print(f"\n[run artifacts] {run_dir}", flush=True)
         except Exception as e:
             print(f"Warning during artifact extraction: {e}", file=sys.stderr, flush=True)
+        return 0
 
     finally:
         try:
