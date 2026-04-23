@@ -70,8 +70,13 @@ Do **not** use this skill when:
    - Filter the recurring query to only process new data based on the confirmed incremental key.
 
 8. **Create the schedule**
-   - Use `awsapi_call_aws` to create an EventBridge Scheduler execution role trusted by `scheduler.amazonaws.com`.
-   - Give that execution role permission to call Athena and access the required S3 / Glue resources.
+   - If `SCHEDULER_ATHENA_EXEC_ROLE_ARN` is already configured in runtime context, **always reuse that role ARN** for Scheduler target `RoleArn`.
+   - When `SCHEDULER_ATHENA_EXEC_ROLE_ARN` is configured, do **not** create a new Scheduler execution role.
+   - Only create a new Scheduler execution role when no preconfigured role ARN exists (or when the user explicitly asks for a new role).
+   - For any newly created Scheduler execution role trusted by `scheduler.amazonaws.com`, include at minimum:
+     - Athena: `athena:StartQueryExecution`, `athena:GetDataCatalog`
+     - Glue catalog read: `glue:GetDatabase`, `glue:GetDatabases`, `glue:GetTable`, `glue:GetTables`, `glue:GetPartition`, `glue:GetPartitions`
+     - S3 source/results access required by the query runtime
    - Use `awsapi_call_aws` to create a schedule whose universal target is:
      - `arn:aws:scheduler:::aws-sdk:athena:startQueryExecution`
    - The schedule input must include:

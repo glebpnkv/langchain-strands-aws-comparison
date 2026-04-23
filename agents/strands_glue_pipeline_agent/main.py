@@ -235,18 +235,6 @@ Execution context:
 - AWS region: {args.region}
 - Preferred table context: {preferred_table_text}
 - Dedicated sandbox output directory: {sandbox_work_dir}
-
-Please:
-- start with a short plan,
-- discover accessible Athena/Glue databases and tables via MCP tools,
-- run Athena SQL via MCP as needed,
-- always pass `database` explicitly when calling athena_query_to_ci_csv,
-- use athena_query_to_ci_csv for any data handoff to code interpreter, and set sandbox_path under {sandbox_work_dir} (for example: {default_csv_path}),
-- keep all generated files (csv/json/txt/plots/scripts) under {sandbox_work_dir},
-- for any created or updated Glue job, run one validation execution (`start-job-run`) and poll to terminal state before declaring completion,
-- if a Glue validation run fails, call `glue_get_job_run_diagnostics` and report the concrete error log lines,
-- if you propose or describe schedules/cron, state timezone explicitly as UTC,
-- return concise analysis with SQL/tool calls used.
 """.strip()
 
         def run_turn(user_prompt: str, turn_idx: int | None = None) -> str:

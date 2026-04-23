@@ -26,10 +26,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 AGENT_DIR="${ROOT_DIR}/agents/strands_glue_pipeline_agent"
 
 GLUE_ASSETS_BUCKET="${GLUE_ASSETS_BUCKET:-}"
-GLUE_ASSETS_PREFIX="${GLUE_ASSETS_PREFIX:-strands-glue-pipeline-agent}"
 GLUE_JOB_ROLE_NAME="${GLUE_JOB_ROLE_NAME:-StrandsGluePythonJobRole}"
-GLUE_JOB_DEFAULT_SCRIPT_KEY="${GLUE_JOB_DEFAULT_SCRIPT_KEY:-${GLUE_ASSETS_PREFIX}/scripts/default_python_shell_job.py}"
-GLUE_TEMP_PREFIX="${GLUE_TEMP_PREFIX:-${GLUE_ASSETS_PREFIX}/temp/}"
+GLUE_JOB_DEFAULT_SCRIPT_KEY="${GLUE_JOB_DEFAULT_SCRIPT_KEY:-scripts/default_python_shell_job.py}"
+GLUE_TEMP_PREFIX="${GLUE_TEMP_PREFIX:-temp/}"
 # Bucket used by Glue jobs for input/output data paths.
 # Defaults to your current demo bucket.
 GLUE_DATA_BUCKET="${GLUE_DATA_BUCKET:-langchain-strands}"
@@ -43,7 +42,7 @@ ATHENA_QUERY_SOURCE_BUCKET="${ATHENA_QUERY_SOURCE_BUCKET:-${GLUE_DATA_BUCKET}}"
 # Scheduler-executed Athena queries write result files here.
 ATHENA_QUERY_RESULTS_BUCKET="${ATHENA_QUERY_RESULTS_BUCKET:-${GLUE_ASSETS_BUCKET}}"
 # Optional prefix to scope Athena result writes in ATHENA_QUERY_RESULTS_BUCKET.
-ATHENA_QUERY_RESULTS_PREFIX="${ATHENA_QUERY_RESULTS_PREFIX:-${GLUE_ASSETS_PREFIX}/athena-results/}"
+ATHENA_QUERY_RESULTS_PREFIX="${ATHENA_QUERY_RESULTS_PREFIX:-athena-results/}"
 CREATE_BUCKET_IF_MISSING="${CREATE_BUCKET_IF_MISSING:-0}"
 
 if ! command -v aws >/dev/null 2>&1; then
@@ -214,20 +213,13 @@ attach_s3_policy() {
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "ListBucketForGluePrefixes",
+      "Sid": "ListAssetsBucket",
       "Effect": "Allow",
       "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
-      "Resource": "arn:aws:s3:::${GLUE_ASSETS_BUCKET}",
-      "Condition": {
-        "StringLike": {
-          "s3:prefix": [
-            "${GLUE_ASSETS_PREFIX}/*"
-          ]
-        }
-      }
+      "Resource": "arn:aws:s3:::${GLUE_ASSETS_BUCKET}"
     },
     {
-      "Sid": "ReadWriteGluePrefixes",
+      "Sid": "ReadWriteAssetsBucket",
       "Effect": "Allow",
       "Action": [
         "s3:GetObject",
@@ -237,7 +229,7 @@ attach_s3_policy() {
         "s3:ListBucketMultipartUploads",
         "s3:ListMultipartUploadParts"
       ],
-      "Resource": "arn:aws:s3:::${GLUE_ASSETS_BUCKET}/${GLUE_ASSETS_PREFIX}/*"
+      "Resource": "arn:aws:s3:::${GLUE_ASSETS_BUCKET}/*"
     },
     {
       "Sid": "ListDataBucketForGlueJobs",
@@ -304,10 +296,14 @@ attach_glue_catalog_policy() {
       "Resource": "*"
     },
     {
-      "Sid": "AthenaStartQueryExecution",
+      "Sid": "AthenaQueryExecutionForGlueJobs",
       "Effect": "Allow",
       "Action": [
-        "athena:StartQueryExecution"
+        "athena:StartQueryExecution",
+        "athena:GetQueryExecution",
+        "athena:GetQueryResults",
+        "athena:StopQueryExecution",
+        "athena:GetWorkGroup"
       ],
       "Resource": "*"
     }
