@@ -2,7 +2,6 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LIBRECHAT_DIR="${ROOT_DIR}/vendor/LibreChat"
 ADAPTER_START_SCRIPT="${ROOT_DIR}/scripts/start_agentcore_openai_adapter.sh"
 
 ADAPTER_HOST="${ADAPTER_HOST:-127.0.0.1}"
@@ -13,18 +12,19 @@ ADAPTER_LOG_FILE="${ADAPTER_LOG_FILE:-${ROOT_DIR}/runs/agentcore_openai_adapter.
 
 usage() {
   cat <<EOF
-Usage: $(basename "$0") <up|start|down|stop|status|logs> [--no-follow]
+Usage: $(basename "$0") <up|down|status>
 
 Commands:
-  up      Start adapter + LibreChat. Follows LibreChat API logs by default.
-  start   Start adapter + LibreChat without following logs.
-  down    Stop LibreChat and the adapter started via this script.
-  stop    Stop adapter started via this script.
-  status  Show adapter health and docker compose status.
-  logs    Follow LibreChat API logs.
+  up      Start the AgentCore OpenAI-compatible adapter as a background process.
+  down    Stop the adapter started via this script.
+  status  Show adapter health and PID file state.
 
-Options:
-  --no-follow  Do not follow logs after \`up\`.
+Environment overrides:
+  ADAPTER_HOST              (default: 127.0.0.1)
+  ADAPTER_PORT              (default: 8800)
+  AGENTCORE_ADAPTER_API_KEY (default: agentcore-local)
+  ADAPTER_PID_FILE          (default: /tmp/agentcore_openai_adapter.pid)
+  ADAPTER_LOG_FILE          (default: <repo>/runs/agentcore_openai_adapter.log)
 EOF
 }
 
@@ -118,36 +118,7 @@ stop_adapter() {
   rm -f "${ADAPTER_PID_FILE}"
 }
 
-start_librechat() {
-  require_command docker
-  echo "Starting LibreChat stack..."
-  (
-    cd "${LIBRECHAT_DIR}"
-    docker compose up -d
-  )
-  echo "[OK] LibreChat started"
-}
-
-stop_librechat() {
-  require_command docker
-  echo "Stopping LibreChat stack..."
-  (
-    cd "${LIBRECHAT_DIR}"
-    docker compose down
-  )
-  echo "[OK] LibreChat stopped"
-}
-
-show_logs() {
-  require_command docker
-  (
-    cd "${LIBRECHAT_DIR}"
-    docker compose logs -f api
-  )
-}
-
 show_status() {
-  require_command docker
   if adapter_healthcheck; then
     echo "[OK] Adapter healthy at http://${ADAPTER_HOST}:${ADAPTER_PORT}"
   else
@@ -165,11 +136,6 @@ show_status() {
   else
     echo "[INFO] Adapter PID file not present: ${ADAPTER_PID_FILE}"
   fi
-
-  (
-    cd "${LIBRECHAT_DIR}"
-    docker compose ps
-  )
 }
 
 main() {
@@ -178,51 +144,13 @@ main() {
     exit 1
   fi
 
-  local cmd="$1"
-  shift
-
-  local follow_logs=1
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --no-follow)
-        follow_logs=0
-        ;;
-      *)
-        echo "ERROR: Unknown option: $1" >&2
-        usage
-        exit 1
-        ;;
-    esac
-    shift
-  done
-
-  case "${cmd}" in
-    up)
-      start_adapter
-      start_librechat
-      if [[ ${follow_logs} -eq 1 ]]; then
-        show_logs
-      fi
-      ;;
-    start)
-      start_adapter
-      start_librechat
-      ;;
-    down)
-      stop_librechat
-      stop_adapter
-      ;;
-    stop)
-      stop_adapter
-      ;;
-    status)
-      show_status
-      ;;
-    logs)
-      show_logs
-      ;;
+  case "$1" in
+    up)     start_adapter ;;
+    down)   stop_adapter ;;
+    status) show_status ;;
+    -h|--help) usage ;;
     *)
-      echo "ERROR: Unknown command: ${cmd}" >&2
+      echo "ERROR: Unknown command: $1" >&2
       usage
       exit 1
       ;;

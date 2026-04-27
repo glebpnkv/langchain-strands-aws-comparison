@@ -202,7 +202,7 @@ attach_athena_glue_policy
 echo
 echo "Deployment finished."
 echo "The AgentCore CLI output includes the runtime ARN."
-echo "Save it for the LibreChat adapter:"
+echo "Save it for the OpenAI-compatible adapter:"
 echo "  export AGENT_RUNTIME_ARN='arn:aws:bedrock-agentcore:...'"
 echo
 echo "Quick test:"

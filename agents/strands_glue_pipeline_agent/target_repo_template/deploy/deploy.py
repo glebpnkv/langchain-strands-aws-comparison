@@ -178,7 +178,7 @@ def _upsert_schedule(scheduler, *, glue_client, job: dict[str, Any], schedule: d
         "ScheduleExpressionTimezone": tz,
         "FlexibleTimeWindow": {"Mode": "OFF"},
         "Target": {
-            "Arn": f"arn:aws:scheduler:::aws-sdk:glue:startJobRun",
+            "Arn": "arn:aws:scheduler:::aws-sdk:glue:startJobRun",
             "RoleArn": schedule_role,
             "Input": f'{{"JobName": "{job["name"]}"}}',
         },

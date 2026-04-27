@@ -210,7 +210,6 @@ def run_agent_mode(args: argparse.Namespace) -> int:
 
         preferred_table_text = args.table if args.table else "(none configured)"
         sandbox_work_dir = f"workspace/{ci_session_name}"
-        default_csv_path = f"{sandbox_work_dir}/athena_query.csv"
 
         if not ensure_sandbox_workspace(code_interpreter_tool, ci_session_name, sandbox_work_dir):
             print(
