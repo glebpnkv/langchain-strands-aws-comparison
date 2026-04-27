@@ -28,15 +28,36 @@ The division of responsibilities is deliberate: **the agent creates Glue jobs on
 
 ## Setup
 
-### 1. Create a GitHub fine-grained PAT
+### 1. Set up a target code repo for the agent
+
+The agent commits generated job code into a separate GitHub repo that you control — not into this repo. The directory [`target_repo_template/`](./target_repo_template/) in this project is a **reference template**: it holds the canonical layout (`jobs/`, `glue-jobs.yaml`, `deploy/deploy.py`, the `build-and-deploy.yml` CI pipeline) that the agent's `project-structure` skill expects. Treat it as a starter scaffold to copy into a fresh repo, not as something the agent commits to directly.
+
+To bootstrap a target repo:
+
+1. Create an empty GitHub repo (e.g. `your-org/glue-jobs`). This is the repo the agent will push branches and PRs to.
+2. Clone it locally, then copy the template scaffold in:
+
+   ```bash
+   # From within an empty clone of your target repo:
+   rsync -a --exclude='.git' /path/to/langchain-strands-aws-comparison/agents/strands_glue_pipeline_agent/target_repo_template/ ./
+   git add .
+   git commit -m "Bootstrap repo layout"
+   git push
+   ```
+
+3. Configure the CI secrets listed in `target_repo_template/README.md` (AWS creds, asset bucket, Glue role ARN). Then push a throwaway branch to confirm the `build-and-deploy.yml` pipeline (`test` → `build-wheels` → `deploy`) goes green end-to-end before running the agent against the repo. A green run on an empty manifest is expected to upload no wheels — that's fine; the first real job push will produce them.
+
+Once that repo exists and CI is green, continue with the PAT in step 2.
+
+### 2. Create a GitHub fine-grained PAT
 
 Fine-grained PATs cannot be created via CLI — GitHub only allows creation through the web UI. Follow these steps exactly:
 
 1. Go to <https://github.com/settings/personal-access-tokens/new>.
 2. **Token name**: anything memorable (e.g. `strands-glue-pipeline-agent-local`).
-3. **Resource owner**: the owner of the target repo. If the repo is in an organisation, select that org — the org must allow fine-grained PATs (Org Settings → Third-party Access → Personal access tokens).
+3. **Resource owner**: the owner of the target repo from step 1. If the repo is in an organisation, select that org — the org must allow fine-grained PATs (Org Settings → Third-party Access → Personal access tokens).
 4. **Expiration**: up to 1 year. Set a calendar reminder to rotate.
-5. **Repository access**: choose **Only select repositories** and pick the single target repo.
+5. **Repository access**: choose **Only select repositories** and pick the single target repo from step 1.
 6. **Repository permissions** — set exactly these, leave everything else at `No access`:
    - **Contents**: `Read and write`
    - **Metadata**: `Read-only` (required, auto-enabled)
@@ -44,7 +65,7 @@ Fine-grained PATs cannot be created via CLI — GitHub only allows creation thro
 7. **Account permissions**: leave all at `No access`.
 8. Click **Generate token**. Copy the token immediately — it is shown only once.
 
-### 2. Configure `.env`
+### 3. Configure `.env`
 
 Copy the template and fill it in:
 
@@ -59,13 +80,13 @@ All values in `.env.template` are documented inline. Key variables:
 | `AWS_PROFILE` / `AWS_REGION` | Yes | Dev AWS account credentials. |
 | `MODEL_ID` | Yes | Bedrock model ID. |
 | `GLUE_JOB_ROLE_ARN` | Yes | IAM role Glue assumes. |
-| `GITHUB_PAT` | Yes | The fine-grained PAT from step 1. |
-| `TARGET_REPO_OWNER` / `TARGET_REPO_NAME` | Yes | Owner and repo name the agent commits to. |
+| `GITHUB_PAT` | Yes | The fine-grained PAT from step 2. |
+| `TARGET_REPO_OWNER` / `TARGET_REPO_NAME` | Yes | Owner and repo name from step 1. |
 | `TARGET_REPO_DEFAULT_BRANCH` | No | Default `main`. |
 | `ATHENA_DATABASE` / `ATHENA_TABLE` | Optional | Default Athena input; user can override per conversation. |
 | `RAW_DATA_BUCKET_S3_URI` | Optional | Default raw-S3 input; enables the raw-S3 flow when no Athena source is given. |
 
-### 3. Install dependencies
+### 4. Install dependencies
 
 ```bash
 cd agents/strands_glue_pipeline_agent
@@ -74,7 +95,7 @@ uv sync  # or: pip install -r requirements.txt
 
 The GitHub MCP server is GitHub's hosted service at `https://api.githubcopilot.com/mcp/` — no local install. The agent authenticates with the fine-grained PAT from `.env`.
 
-### 4. Set up AWS Glue prerequisites
+### 5. Set up AWS Glue prerequisites
 
 See `setup_glue_job_prereqs.sh` for IAM roles, S3 staging locations, and Bedrock access. Run it once per dev account.
 
@@ -103,20 +124,6 @@ The agent auto-loads every skill under `skills/`:
 - **`glue-python-shell-job`** — two-phase (scratch via MCP + commit-driven deploy) Glue Python Shell job flow.
 - **`s3-raw-data-ingestion`** — discovery flow for raw data in S3 that isn't catalogued in Athena.
 - **`project-structure`** — directory layout, package naming, and entrypoint conventions for committed code. Points at the canonical scaffold in `target_repo_template/`.
-
-## Target repo scaffold
-
-The canonical layout the agent will commit to is maintained at [`target_repo_template/`](./target_repo_template/) in this repo. To initialise an empty target repo:
-
-```bash
-# From within an empty clone of your target repo:
-rsync -a --exclude='.git' /path/to/langchain-strands-aws-comparison/agents/strands_glue_pipeline_agent/target_repo_template/ ./
-git add .
-git commit -m "Bootstrap repo layout"
-git push
-```
-
-Then configure the CI secrets listed in `target_repo_template/README.md` (AWS creds, asset bucket, Glue role ARN) and push a throwaway branch to confirm the pipeline is green end-to-end before running the agent against it.
 
 ## Current limitations
 
