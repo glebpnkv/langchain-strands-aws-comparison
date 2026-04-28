@@ -208,3 +208,10 @@ __marimo__/
 
 # Runs logs
 runs/
+
+# Chainlit local-dev artifacts (config, translations, file uploads)
+.chainlit/
+.files/
+
+# macOS
+.DS_Store

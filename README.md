@@ -75,6 +75,128 @@ Optional: list Athena MCP tools before running:
 python agents/langchain-agent/main.py --list-tools
 ```
 
+## Running `strands_glue_pipeline_agent` (Chainlit chat frontend)
+
+The headliner agent runs as a FastAPI service behind a Chainlit chat UI, with
+Phoenix for LLM tracing. **One script brings up the whole stack:**
+
+```bash
+aws sso login
+./scripts/run_local_stack.sh
+```
+
+| Surface         | URL                       |
+|-----------------|---------------------------|
+| Chainlit (chat) | http://127.0.0.1:8000     |
+| Phoenix (UI)    | http://127.0.0.1:6006     |
+| Agent API       | http://127.0.0.1:8080     |
+
+`Ctrl-C` in the same terminal stops everything cleanly. Phoenix data persists
+across restarts in a named docker volume; the agent and frontend each write
+logs to `runs/<service>/<timestamp>/` (see [Observability](#observability) below).
+
+To skip Phoenix or use a hosted backend (Langfuse, Honeycomb, anything OTLP-shaped):
+
+```bash
+SKIP_PHOENIX=1 OTEL_EXPORTER_OTLP_ENDPOINT=https://your-collector \
+  AGENT_OTLP_ENABLE=1 ./scripts/run_local_stack.sh
+```
+
+This branch (`feature/chainlit-ui`) is active work-in-progress — see
+[PLAN.md](PLAN.md) for the phase roadmap and commit links.
+
+### Debugging individual services
+
+When a piece is misbehaving and you want to iterate on just it, the local-stack
+script is overkill. Bring up only what you need:
+
+```bash
+./scripts/run_agent_local.sh strands_glue_pipeline_agent   # agent FastAPI
+./scripts/run_frontend_local.sh                            # Chainlit
+```
+
+These omit Phoenix entirely — set `OTEL_EXPORTER_OTLP_ENDPOINT` and
+`AGENT_OTLP_ENABLE=1` yourself if you want OTLP export.
+
+### Known limitations (Phase 3b persistence)
+
+- **Resumed threads can't continue the conversation.** Refreshing the page or
+  reopening a thread from the sidebar restores the displayed history from
+  Postgres, but the agent service is unaware of the resumed thread —
+  follow-up questions land on a fresh agent session with no prior context.
+  Two pieces still need wiring: (a) `@cl.on_chat_resume` on the frontend to
+  link the resumed thread back to its `agent_session_id`, and (b) the agent
+  service either becoming stateless (frontend ships full message history per
+  request) or persisting `SessionRegistry` state across restarts. Tracked for
+  a future phase; for now treat resumed threads as read-only history.
+- **Inline element bytes don't replay on resume.** `cl.Image` / `cl.Plotly` /
+  `cl.Dataframe` content for resumed threads needs an S3-backed
+  `storage_provider` on `SQLAlchemyDataLayer`; without one, resumed threads
+  show the structure (text, tool steps) but not the rendered charts/tables.
+  Comes with the CDK work in Phase 4.
+
+### Architecture
+
+```
+Browser ──▶ Chainlit  ──HTTP+SSE──▶ FastAPI agent service  ──▶ Bedrock / Athena / Glue / sandbox
+   :8000                              :8080                       (your AWS account)
+```
+
+- `frontend/` — Chainlit chat UI. Consumes the `v1` SSE protocol (`text.delta`,
+  `tool.start/end`, `ui.dataframe`, `ui.plotly`, `ui.image`, `done`, `error`)
+  and renders tool steps, tables (`cl.Dataframe`), Plotly charts (`cl.Plotly`),
+  and images (`cl.Image`) inline in the chat.
+- `agent_server/` — shared FastAPI scaffold: routing, auth middleware, SSE
+  plumbing, in-memory session registry, Strands→SSE event reducer, and the
+  `display_dataframe` / `display_plotly` / `display_image` tool factories.
+  Adding a new agent is a ~30-line `server/main.py` that supplies an agent
+  factory and reuses everything else.
+- `agents/<agent>/server/main.py` — the per-agent thin wrapper. The
+  `strands_glue_pipeline_agent` one wires up sandbox text and image loaders
+  so display tools resolve sandbox file paths server-side rather than
+  pulling bytes through the LLM context.
+
+### Observability
+
+Every boot of the agent service writes to a fresh per-process directory:
+
+```
+runs/<service-name>/<YYYYmmddTHHMMSS>/
+├── server.log              # all logs at AGENT_LOG_LEVEL (default INFO)
+└── strands_traces.jsonl    # Strands' OpenTelemetry spans, one JSON per line
+```
+
+When `AGENT_OTLP_ENABLE=1` (the local-stack script sets this), spans are also
+pushed to `OTEL_EXPORTER_OTLP_ENDPOINT` over OTLP HTTP/protobuf — Phoenix by
+default. The `openinference-instrumentation-bedrock` package emits
+OpenInference-conformant LLM child spans nested under Strands' agent-level
+parents, so Phoenix's UI shows model name, prompt / completion / total token
+counts, and computed cost per call.
+
+**Persistence.** Phoenix stores its SQLite DB inside the named docker volume
+`phoenix-agent-traces-data`, so traces persist across restarts of the local
+stack. To wipe history:
+
+```bash
+docker volume rm phoenix-agent-traces-data
+```
+
+To swap Phoenix for a hosted backend (Langfuse, Honeycomb, anything OTLP-shaped),
+unset `SKIP_PHOENIX` and just override `OTEL_EXPORTER_OTLP_ENDPOINT` /
+`OTEL_EXPORTER_OTLP_HEADERS` — the agent has no hard dependency on Phoenix.
+
+### Useful env knobs
+
+| Variable                       | Default                  | Purpose |
+|--------------------------------|--------------------------|---------|
+| `AGENT_LOG_LEVEL`              | `INFO`                   | Set to `DEBUG` to surface httpx/botocore noise |
+| `AGENT_RUN_DIR`                | `runs`                   | Base dir for per-process subdirs |
+| `AGENT_OTLP_ENABLE`            | unset                    | `1` to enable OTLP export |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`  | unset                    | OTLP HTTP endpoint, e.g. `http://127.0.0.1:6006` |
+| `AGENT_SERVICE_AUTH_SECRET`    | unset                    | Shared secret between Chainlit and the agent. Unset = unauthenticated local dev. |
+| `PHOENIX_PORT`                 | `6006`                   | Phoenix UI + OTLP receiver |
+| `AGENT_PORT` / `FRONTEND_PORT` | `8080` / `8000`          | If you need to dodge a port collision |
+
 ## Exposing the Deployed AgentCore Runtime as an OpenAI-compatible API
 
 The local adapter wraps the deployed AgentCore runtime in an OpenAI-compatible HTTP API, usable from any OpenAI-style client (curl, Open WebUI, custom code, etc.).

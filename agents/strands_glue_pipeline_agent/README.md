@@ -101,20 +101,23 @@ See `setup_glue_job_prereqs.sh` for IAM roles, S3 staging locations, and Bedrock
 
 ## Running locally
 
+The default path is the Chainlit chat frontend with Phoenix tracing — one
+script brings up the FastAPI service, the UI, and the trace UI together:
+
+```bash
+aws sso login
+./scripts/run_local_stack.sh    # from the repo root
+```
+
+Open http://127.0.0.1:8000 for the chat UI and http://127.0.0.1:6006 for
+Phoenix. Full details and overrides are in the root [README.md](../../README.md).
+
+For one-shot CLI runs (no UI, no service), `main.py` is still here:
+
 ```bash
 cd agents/strands_glue_pipeline_agent
-uv run python main.py
-```
-
-Or with a one-shot prompt:
-
-```bash
 uv run python main.py --prompt "Build a Glue job that averages daily orders from myschema.orders and writes to s3://my-outputs/daily-avg/"
 ```
-
-## Running on AgentCore
-
-See `agentcore_runtime.py` and `../../scripts/deploy_strands_glue_pipeline_agentcore.sh`.
 
 ## Skills
 
@@ -135,9 +138,15 @@ These are deliberate simplifications, not bugs. They are the next items to addre
 - **PySpark jobs are not yet supported.** The agent handles Python Shell jobs only. A dedicated PySpark skill will be added in a separate branch. The reference PySpark scaffold that previously lived at `target_repo_template/jobs/example_pyspark/` has been removed until then.
 - **Tool-spam guarding is narrow.** `GlueJobRunPollThrottleHook` throttles repeated `get-job-run` polls across the MCP tool and the `awsapi_call_aws` CLI fallback, but it only covers that one operation. The model has been observed to spam other identical tool calls (e.g. repeated `aws glue get-job-run` or `aws athena get-query-execution` via arbitrary paths) while claiming in its text that it's waiting. The next step is a more general pattern — likely either (a) a generic "identical `(tool_name, canonicalised_args)` within N seconds → sleep" hook as defence-in-depth, or (b) an industry pattern such as token-bucket rate limiters per tool class, AWS SDK-style exponential backoff at the hook layer, or explicit "wait N seconds" synthetic tool calls that the model must make between polls. Needs research before committing to a design.
 
-## Deploying to ECS (future)
+## Deploying to ECS
 
-When this agent moves to ECS, the `GITHUB_PAT` environment variable should come from AWS Secrets Manager and be injected via the task definition's `secrets` block. Do NOT bake the PAT into the image or a `.env` inside the image.
+This agent is being migrated from Bedrock AgentCore to ECS Fargate. The new topology runs the agent as a FastAPI service that streams typed SSE events to a separate Chainlit frontend service. Infrastructure (VPC, ECR, RDS, ALBs, IAM roles, ECS services) is provisioned via CDK Python in [`../../infra/`](../../infra/).
+
+The IAM policy granting Glue/S3/Logs/PassRole access to the agent task role lives at [`../../infra/policies/strands_glue_pipeline_access.json`](../../infra/policies/strands_glue_pipeline_access.json) (extracted from the previous AgentCore deploy script). Outstanding scope-down work and the Athena-permissions extension are documented in [`../../infra/policies/README.md`](../../infra/policies/README.md).
+
+Secret material — `GITHUB_PAT`, the Bedrock model ID override, the service-to-service auth token between frontend and agent — is held in AWS Secrets Manager and injected via the ECS task definition's `secrets` block. **Never bake `GITHUB_PAT` into the image or a `.env` inside the image.**
+
+End-to-end deployment scripts (`scripts/deploy_agent.sh`, `scripts/deploy_frontend.sh`) and the CDK stacks land in subsequent phases of this branch.
 
 
 
