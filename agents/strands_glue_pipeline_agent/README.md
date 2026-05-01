@@ -2,15 +2,18 @@
 
 A Strands-based agent that builds, tests, and delivers AWS Glue Python Shell jobs. It iterates on jobs in a dev AWS account, commits the production version to a pre-specified GitHub repo, and opens a PR once the wheel-based production run succeeds.
 
+The agent runs as a FastAPI service behind a Chainlit chat UI, with Phoenix for LLM tracing. Local development uses `docker compose`-style containers; the deployed version uses ECS Fargate provisioned by CDK Python.
+
 ## Requirements
 
 **This agent requires a GitHub fine-grained Personal Access Token.** Startup will fail or the first GitHub tool call will error without one. See [Setup](#setup) below.
 
 Other prerequisites:
 - AWS credentials for a dev account (profile configured in `~/.aws/config` or via env vars).
-- Python 3.11+ and `uv` (or `pip`) to install dependencies.
+- Python 3.13+ and `uv` to install dependencies.
 - Outbound HTTPS to `api.githubcopilot.com` (the agent uses GitHub's hosted MCP server; no local install).
 - Access to Bedrock in the configured region for the chosen model.
+- For deployment: Docker Desktop, the AWS CDK CLI (`npm install -g aws-cdk`), and the Session Manager plugin (`brew install --cask session-manager-plugin` on macOS).
 
 ## How it works (end-to-end flow)
 
@@ -89,8 +92,8 @@ All values in `.env.template` are documented inline. Key variables:
 ### 4. Install dependencies
 
 ```bash
-cd agents/strands_glue_pipeline_agent
-uv sync  # or: pip install -r requirements.txt
+# from repo root
+uv sync
 ```
 
 The GitHub MCP server is GitHub's hosted service at `https://api.githubcopilot.com/mcp/` — no local install. The agent authenticates with the fine-grained PAT from `.env`.
@@ -101,23 +104,90 @@ See `setup_glue_job_prereqs.sh` for IAM roles, S3 staging locations, and Bedrock
 
 ## Running locally
 
-The default path is the Chainlit chat frontend with Phoenix tracing — one
-script brings up the FastAPI service, the UI, and the trace UI together:
+### Architecture
+
+```
+Browser ──▶ Chainlit  ──HTTP+SSE──▶ FastAPI agent service  ──▶ Bedrock / Athena / Glue / sandbox
+   :8000                              :8080                       (your AWS account)
+```
+
+- `frontend/` — Chainlit chat UI. Consumes the `v1` SSE protocol (`text.delta`, `tool.start/end`, `ui.dataframe`, `ui.plotly`, `ui.image`, `done`, `error`) and renders tool steps, tables (`cl.Dataframe`), Plotly charts (`cl.Plotly`), and images (`cl.Image`) inline in the chat.
+- `agent_server/` — shared FastAPI scaffold: routing, auth middleware, SSE plumbing, in-memory session registry, Strands→SSE event reducer, and the `display_dataframe` / `display_plotly` / `display_image` tool factories. Adding a new agent is a ~30-line `server/main.py` that supplies an agent factory and reuses everything else.
+- `agents/<agent>/server/main.py` — the per-agent thin wrapper. The `strands_glue_pipeline_agent` one wires up sandbox text and image loaders so display tools resolve sandbox file paths server-side rather than pulling bytes through the LLM context.
+
+### Full stack
+
+One script brings up the FastAPI service, Postgres for thread persistence, the Chainlit UI, and Phoenix for LLM tracing:
 
 ```bash
 aws sso login
 ./scripts/run_local_stack.sh    # from the repo root
 ```
 
-Open http://127.0.0.1:8000 for the chat UI and http://127.0.0.1:6006 for
-Phoenix. Full details and overrides are in the root [README.md](../../README.md).
+| Surface         | URL                       |
+|-----------------|---------------------------|
+| Chainlit (chat) | http://127.0.0.1:8000     |
+| Phoenix (UI)    | http://127.0.0.1:6006     |
+| Agent API       | http://127.0.0.1:8080     |
 
-For one-shot CLI runs (no UI, no service), `main.py` is still here:
+`Ctrl-C` in the same terminal stops everything cleanly. Phoenix data persists across restarts in a named docker volume; the agent and frontend each write logs to `runs/<service>/<timestamp>/`.
+
+To skip Phoenix or use a hosted backend (Langfuse, Honeycomb, anything OTLP-shaped):
+
+```bash
+SKIP_PHOENIX=1 OTEL_EXPORTER_OTLP_ENDPOINT=https://your-collector \
+  AGENT_OTLP_ENABLE=1 ./scripts/run_local_stack.sh
+```
+
+### Debugging individual services
+
+When a piece is misbehaving and you want to iterate on just it, the local-stack script is overkill. Bring up only what you need:
+
+```bash
+./scripts/run_agent_local.sh strands_glue_pipeline_agent   # agent FastAPI
+./scripts/run_frontend_local.sh                            # Chainlit
+```
+
+These omit Phoenix entirely — set `OTEL_EXPORTER_OTLP_ENDPOINT` and `AGENT_OTLP_ENABLE=1` yourself if you want OTLP export.
+
+### Observability
+
+Every boot of the agent service writes to a fresh per-process directory:
+
+```
+runs/<service-name>/<YYYYmmddTHHMMSS>/
+├── server.log              # all logs at AGENT_LOG_LEVEL (default INFO)
+└── strands_traces.jsonl    # Strands' OpenTelemetry spans, one JSON per line
+```
+
+When `AGENT_OTLP_ENABLE=1` (the local-stack script sets this), spans are also pushed to `OTEL_EXPORTER_OTLP_ENDPOINT` over OTLP HTTP/protobuf — Phoenix by default. The `openinference-instrumentation-bedrock` package emits OpenInference-conformant LLM child spans nested under Strands' agent-level parents, so Phoenix's UI shows model name, prompt / completion / total token counts, and computed cost per call.
+
+**Phoenix persistence.** Phoenix stores its SQLite DB inside the named docker volume `phoenix-agent-traces-data`, so traces persist across restarts of the local stack. To wipe history:
+
+```bash
+docker volume rm phoenix-agent-traces-data
+```
+
+### One-shot CLI (no UI, no service)
+
+`main.py` is still here for ad-hoc CLI runs:
 
 ```bash
 cd agents/strands_glue_pipeline_agent
 uv run python main.py --prompt "Build a Glue job that averages daily orders from myschema.orders and writes to s3://my-outputs/daily-avg/"
 ```
+
+### Useful env knobs
+
+| Variable                       | Default                  | Purpose |
+|--------------------------------|--------------------------|---------|
+| `AGENT_LOG_LEVEL`              | `INFO`                   | Set to `DEBUG` to surface httpx/botocore noise |
+| `AGENT_RUN_DIR`                | `runs`                   | Base dir for per-process subdirs |
+| `AGENT_OTLP_ENABLE`            | unset                    | `1` to enable OTLP export |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`  | unset                    | OTLP HTTP endpoint, e.g. `http://127.0.0.1:6006` |
+| `AGENT_SERVICE_AUTH_SECRET`    | unset                    | Shared secret between Chainlit and the agent. Unset = unauthenticated local dev. |
+| `PHOENIX_PORT`                 | `6006`                   | Phoenix UI + OTLP receiver |
+| `AGENT_PORT` / `FRONTEND_PORT` | `8080` / `8000`          | If you need to dodge a port collision |
 
 ## Skills
 
@@ -126,28 +196,202 @@ The agent auto-loads every skill under `skills/`:
 - **`athena-query-execution`** — SQL-only pipelines run via Athena.
 - **`glue-python-shell-job`** — two-phase (scratch via MCP + commit-driven deploy) Glue Python Shell job flow.
 - **`s3-raw-data-ingestion`** — discovery flow for raw data in S3 that isn't catalogued in Athena.
+- **`sandbox-artifacts`** — convention for surfacing analysis outputs (charts, tables, images) inline in the chat without flooding the model context.
 - **`project-structure`** — directory layout, package naming, and entrypoint conventions for committed code. Points at the canonical scaffold in `target_repo_template/`.
 
-## Current limitations
+## Deploying to AWS
+
+Infrastructure lives under [`../../infra/`](../../infra/) (CDK Python). Application images are built and rolled out by [`../../scripts/deploy.sh`](../../scripts/deploy.sh). Teardown is a single script.
+
+### Architecture (deployed)
+
+```
+Browser ─HTTPS─▶ ALB (Cognito auth)* ─▶ Chainlit ECS service ─▶ RDS Postgres
+                                              │
+                                              │  HTTP+SSE (X-Service-Auth)
+                                              ▼
+                                  Internal ALB ─▶ Agent ECS service ─▶ Bedrock / Athena / Glue / sandbox
+```
+
+\* Cognito auth lands with the SSO subsection below; until then, the frontend ALB is internal-only and reachable via SSM port-forward.
+
+Four CDK stacks, all named `GlueAgent-<Layer>-Dev`:
+
+- **Network** — VPC (10.0.0.0/16), 2 AZs, 1 NAT gateway, 5 security groups.
+- **Data** — RDS Postgres `db.t4g.micro`, single-AZ, 20 GB GP3, master credentials in Secrets Manager.
+- **Ecr** — two ECR repos (`glue-agent/agent`, `glue-agent/frontend`) with 10-image lifecycle policy.
+- **Compute** — Fargate cluster, agent + frontend task definitions / services, two internal ALBs, three SM secrets, IAM roles.
+
+Cost ballpark when fully deployed (idle): ~$80–100/mo.
+- NAT gateway $32 + RDS $13 + 2 ALBs $32 + storage/secrets $3.
+- ECS task hours roughly +$15–30/mo with desiredCount=1.
+- Bedrock and Athena pay-per-use on top.
+
+### One-time setup per AWS account + region
+
+```bash
+cd infra
+cdk bootstrap aws://<account-id>/<region>
+```
+
+(account-id from `aws sts get-caller-identity --query Account --output text`). Creates a small set of supporting resources CDK needs (S3 asset bucket, IAM deploy role, SSM version param). ~$0/mo idle.
+
+### First deploy — full sequence
+
+```bash
+aws sso login
+
+# 1. Provision the infra. Network -> Data -> Ecr -> Compute, in dependency
+#    order. Both ECS services come up at desiredCount=0 (no images yet).
+cd infra && cdk deploy --all --require-approval never && cd -
+
+# 2. Populate the GitHub PAT secret (only needed once; re-run only on rotation).
+aws secretsmanager put-secret-value \
+  --secret-id GlueAgent/Dev/GithubPat \
+  --secret-string "<your-fine-grained-pat>"
+
+# 3. Build, push, and roll out the container images. The single
+#    deploy.sh takes which service to ship; `all` does both, agent
+#    first. It tags by short git SHA + :latest, pushes both tags, and
+#    bumps desiredCount from 0 to 1 on the first run.
+./scripts/deploy.sh all
+```
+
+### Subsequent deploys
+
+Re-run the script targeting just what you changed:
+
+```bash
+./scripts/deploy.sh agent       # only the agent FastAPI service
+./scripts/deploy.sh frontend    # only the Chainlit frontend
+./scripts/deploy.sh all         # both
+```
+
+Each invocation rolls the service over to the new image with `--force-new-deployment` and waits for ECS to report it stable. Tag includes a `-dirty` suffix when the working tree has uncommitted changes, so a running task's tag is always traceable.
+
+### Reaching the deployed UI (until SSO lands)
+
+Both ALBs are internal-scheme — no public DNS. Port-forward through a running Fargate task:
+
+```bash
+CLUSTER=$(aws ssm get-parameter --name /glue-agent/dev/cluster-name --query Parameter.Value --output text)
+FRONTEND_SVC=$(aws ssm get-parameter --name /glue-agent/dev/frontend/service-name --query Parameter.Value --output text)
+TASK_ARN=$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$FRONTEND_SVC" --query 'taskArns[0]' --output text)
+TASK_ID=$(echo "$TASK_ARN" | awk -F'/' '{print $NF}')
+RUNTIME_ID=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" --query 'tasks[0].containers[0].runtimeId' --output text)
+
+aws ssm start-session \
+  --target "ecs:${CLUSTER}_${TASK_ID}_${RUNTIME_ID}" \
+  --document-name AWS-StartPortForwardingSession \
+  --parameters '{"portNumber":["8000"],"localPortNumber":["8000"]}'
+```
+
+Open <http://localhost:8000> in your browser. Login is `admin / admin` (placeholder; replaced once Cognito is wired up — see SSO subsection below).
+
+### Tearing down
+
+The deployed dev stack costs roughly $80–100/mo idle. When you're not actively demoing, tear it all down:
+
+```bash
+./scripts/teardown_dev_stack.sh
+```
+
+Lists the live `GlueAgent-*-Dev` stacks, asks for `yes`, runs `cdk destroy --all --force`, and verifies nothing remains. RDS data and ECR images go with the stacks — fine for dev, not for prod. Re-deploying after a teardown is just `cdk deploy --all` followed by `./scripts/deploy.sh all`.
+
+### Setting up a domain and SSO (Cognito + ALB)
+
+Cognito + ALB authentication requires HTTPS, which requires a domain you control. **Buy or bring your own domain first**, then the SSO CDK changes can wire it in.
+
+#### Option A: buy a fresh domain through Route 53
+
+Cheapest end-to-end for a project that has none today. ~$13–30 for the first year depending on TLD.
+
+1. AWS console → **Route 53** → **Registered domains** → **Register domain**.
+2. Search for an available name. `.com` is ~$13/year; `.io`, `.dev`, `.cloud` etc. vary.
+3. Fill in WHOIS contact info. Toggle **Privacy protection** (free, hides your details from public WHOIS).
+4. Pay. The registration is usually done in 5–10 minutes (occasionally up to a day for some TLDs).
+5. Route 53 automatically creates a **public hosted zone** for your new domain. That's the thing the CDK stack will plug into.
+6. Note the **hosted zone ID** (Route 53 → Hosted zones → click the zone → copy the `Z…` value at the top).
+
+#### Option B: use a domain you already own (registered elsewhere)
+
+You can keep the registrar but delegate DNS to Route 53. ~30 min of clicking + an hour of DNS propagation.
+
+1. AWS console → **Route 53** → **Hosted zones** → **Create hosted zone**.
+2. Domain name: the domain you already own (e.g. `example.com`) **or a subdomain** (e.g. `agent.example.com`) if you only want to delegate part of it. Type: **Public hosted zone**.
+3. Open the new zone. Note the four **NS records** at the top — you'll see something like `ns-1234.awsdns-12.org`, etc.
+4. Go to your existing registrar (GoDaddy, Cloudflare, Namecheap, etc.). For the domain (or subdomain), set the nameservers to the four `awsdns-*` values from step 3. The exact UI varies but every registrar has an "NS records" or "Nameservers" section.
+5. Wait for DNS to propagate. Quickest check:
+   ```bash
+   dig +short NS yourdomain.com
+   ```
+   Expect the four `awsdns-*` values to appear within 30–60 minutes (TTL-dependent; can be up to 48 hours in pathological cases).
+6. Note the hosted zone ID (`Z…`) — same place as Option A.
+
+#### What CDK will do once SSO is added
+
+The upcoming compute-stack changes consume the hosted zone ID via `--context hosted_zone_id=Z...` (or pinned in `cdk.json`):
+
+- Provision an **ACM certificate** for `chat.<yourdomain>` (or whatever subdomain you pick). ACM auto-validates by adding a DNS record to the hosted zone — no manual step.
+- Create a **Cognito User Pool** with self-signup disabled, email-as-username, email verification required. Plus a **User Pool Client** configured for the OAuth code-grant flow against the ALB.
+- Create a **Cognito hosted-UI domain** (defaults to a `*.auth.<region>.amazoncognito.com` prefix; can be a custom domain later).
+- Switch the frontend ALB from internet-facing-internal to **internet-facing with a HTTPS listener**, gated by a Cognito authenticate action on the listener rule.
+- Add a Route 53 **A record (alias)** pointing your subdomain at the ALB.
+
+After deploy, your demo URL is `https://chat.<yourdomain>` and any visitor without a valid Cognito session is bounced to the Cognito hosted login page first.
+
+#### Adding and removing demo users
+
+Once Cognito lands, here's the lifecycle (the same commands today against the not-yet-provisioned pool, will work as-is once the stack is deployed):
+
+```bash
+# Look up the pool ID once
+POOL_ID=$(aws ssm get-parameter --name /glue-agent/dev/cognito/user-pool-id \
+  --query Parameter.Value --output text)
+
+# Invite a stakeholder. They get an email with a temporary password.
+aws cognito-idp admin-create-user \
+  --user-pool-id "$POOL_ID" \
+  --username alice@example.com \
+  --user-attributes Name=email,Value=alice@example.com Name=email_verified,Value=true \
+  --desired-delivery-mediums EMAIL
+
+# What happens next, on the user's side:
+#   1. Cognito emails them a temporary password.
+#   2. They visit https://chat.<yourdomain>, get redirected to Cognito login.
+#   3. They sign in with email + temp password.
+#   4. Cognito forces a password change on first login.
+#   5. They set a permanent password and reach the chat UI.
+
+# Disable a user (reversible — revokes access, keeps the account).
+aws cognito-idp admin-disable-user --user-pool-id "$POOL_ID" --username alice@example.com
+
+# Re-enable.
+aws cognito-idp admin-enable-user --user-pool-id "$POOL_ID" --username alice@example.com
+
+# Permanently remove.
+aws cognito-idp admin-delete-user --user-pool-id "$POOL_ID" --username alice@example.com
+
+# List all users in the pool.
+aws cognito-idp list-users --user-pool-id "$POOL_ID" \
+  --query 'Users[].{email:Username,status:UserStatus,enabled:Enabled}' --output table
+```
+
+Cognito is free for the first 50,000 monthly active users, so for a stakeholder demo there's no per-user cost.
+
+## Known limitations
 
 These are deliberate simplifications, not bugs. They are the next items to address.
+
+### Persistence (Phase 3b)
+
+- **Resumed threads can't continue the conversation.** Refreshing the page or reopening a thread from the sidebar restores the displayed history from Postgres, but the agent service is unaware of the resumed thread — follow-up questions land on a fresh agent session with no prior context. Two pieces still need wiring: (a) `@cl.on_chat_resume` on the frontend to link the resumed thread back to its `agent_session_id`, and (b) the agent service either becoming stateless (frontend ships full message history per request) or persisting `SessionRegistry` state across restarts. Tracked for a future phase; for now treat resumed threads as read-only history.
+- **Inline element bytes don't replay on resume.** `cl.Image` / `cl.Plotly` / `cl.Dataframe` content for resumed threads needs an S3-backed `storage_provider` on `SQLAlchemyDataLayer`; without one, resumed threads show the structure (text, tool steps) but not the rendered charts/tables. Comes with the SSO/HTTPS work.
+
+### Agent behaviour
 
 - **The agent does not poll GitHub Actions for the CI pipeline.** After pushing to the feature branch it ends the turn and asks the user to resume once CI is green. Automating this is a drop-in upgrade once the CI pipeline is stable.
 - **The agent does not watch for PR merge.** Its turn ends at "PR open + Phase B verification run succeeded." Post-merge verification is a fresh conversation.
 - **The CI pipeline in the target repo (`.github/workflows/build-and-deploy.yml`) uses static AWS access keys.** OIDC federation is the intended production upgrade.
 - **PySpark jobs are not yet supported.** The agent handles Python Shell jobs only. A dedicated PySpark skill will be added in a separate branch. The reference PySpark scaffold that previously lived at `target_repo_template/jobs/example_pyspark/` has been removed until then.
 - **Tool-spam guarding is narrow.** `GlueJobRunPollThrottleHook` throttles repeated `get-job-run` polls across the MCP tool and the `awsapi_call_aws` CLI fallback, but it only covers that one operation. The model has been observed to spam other identical tool calls (e.g. repeated `aws glue get-job-run` or `aws athena get-query-execution` via arbitrary paths) while claiming in its text that it's waiting. The next step is a more general pattern — likely either (a) a generic "identical `(tool_name, canonicalised_args)` within N seconds → sleep" hook as defence-in-depth, or (b) an industry pattern such as token-bucket rate limiters per tool class, AWS SDK-style exponential backoff at the hook layer, or explicit "wait N seconds" synthetic tool calls that the model must make between polls. Needs research before committing to a design.
-
-## Deploying to ECS
-
-This agent is being migrated from Bedrock AgentCore to ECS Fargate. The new topology runs the agent as a FastAPI service that streams typed SSE events to a separate Chainlit frontend service. Infrastructure (VPC, ECR, RDS, ALBs, IAM roles, ECS services) is provisioned via CDK Python in [`../../infra/`](../../infra/).
-
-The IAM policy granting Glue/S3/Logs/PassRole access to the agent task role lives at [`../../infra/policies/strands_glue_pipeline_access.json`](../../infra/policies/strands_glue_pipeline_access.json) (extracted from the previous AgentCore deploy script). Outstanding scope-down work and the Athena-permissions extension are documented in [`../../infra/policies/README.md`](../../infra/policies/README.md).
-
-Secret material — `GITHUB_PAT`, the Bedrock model ID override, the service-to-service auth token between frontend and agent — is held in AWS Secrets Manager and injected via the ECS task definition's `secrets` block. **Never bake `GITHUB_PAT` into the image or a `.env` inside the image.**
-
-End-to-end deployment scripts (`scripts/deploy_agent.sh`, `scripts/deploy_frontend.sh`) and the CDK stacks land in subsequent phases of this branch.
-
-
-
-uv run python main.py --prompt "Build a Glue job that counts rows in sample_database.sample_table and writes the count to s3://glue-assets-554032904022-eu-central-1-an/scratch/row-count/."
