@@ -7,27 +7,29 @@
 #   ./scripts/deploy.sh all         # both, agent first
 #
 # Prerequisites:
-#   - The CDK stacks have been deployed (`cd infra && cdk deploy --all`).
+#   - The Ecr stack has been deployed (so the ECR repos exist). For a
+#     fresh repo, use `./scripts/bootstrap.sh` instead — it sequences
+#     the first-deploy chicken-and-egg correctly.
 #   - You're authenticated to AWS (e.g. `aws sso login`).
 #   - Docker is running on your machine.
 #
 # What it does, per service:
-#   1. Reads cluster / service / repo URI from SSM Parameter Store
-#      entries the CDK Compute stack writes — no CFN-output parsing.
+#   1. Reads repo URI (and, if available, cluster + service names) from
+#      SSM Parameter Store entries the CDK stacks write.
 #   2. docker build with --platform linux/amd64 (matches the task
 #      definition's CpuArchitecture.X86_64; cross-compiles via buildx
 #      on M-series Macs).
 #   3. Tags <repo>:<git-short-sha>[-dirty] and <repo>:latest, pushes both.
 #      The dirty suffix flags deploys from uncommitted working trees so
 #      a running task's tag is always traceable to a real git commit.
-#   4. ECS update-service. First run (desiredCount==0) bumps to 1
-#      simultaneously with --force-new-deployment; subsequent runs
-#      do a rolling replacement at the existing count.
-#   5. aws ecs wait services-stable until ECS reports the new tasks
-#      healthy.
+#   4. If the ECS service exists (cluster-name and service-name SSM
+#      params are present), update-service --force-new-deployment and
+#      wait for it to stabilize. Otherwise the script runs in
+#      "push-only" mode — useful during bootstrap, when the Compute
+#      stack hasn't been deployed yet and the services don't exist.
 #
-# Idempotent: same script handles "first deploy" and "rolling
-# replacement" cleanly. Safe to re-run.
+# Idempotent: same script handles bootstrap, first deploy, and rolling
+# replacement cleanly. Safe to re-run.
 #
 # Env knobs:
 #   AWS_REGION   default eu-central-1   (must match the CDK deploy region)
@@ -85,18 +87,31 @@ deploy_one() {
   cluster_name="$(ssm_get "${SSM_PREFIX}/cluster-name")"
   service_name="$(ssm_get "${SSM_PREFIX}/${svc}/service-name")"
 
-  if [[ -z "${repo_uri}" || -z "${cluster_name}" || -z "${service_name}" ]]; then
+  # repo-uri is the only hard requirement — without it we can't even
+  # tag the image. cluster + service are optional: if they're missing,
+  # the Compute stack hasn't been deployed yet and we're in bootstrap
+  # mode (push the image so the Compute deploy can pull it).
+  if [[ -z "${repo_uri}" ]]; then
     cat <<EOF >&2
-ERROR: Missing SSM parameters under ${SSM_PREFIX}.
-  ${svc}/repo-uri      = ${repo_uri:-<missing>}
-  cluster-name         = ${cluster_name:-<missing>}
-  ${svc}/service-name  = ${service_name:-<missing>}
+ERROR: Missing SSM parameter ${SSM_PREFIX}/${svc}/repo-uri.
 
-Run \`cdk deploy --all\` from infra/ first to create the stacks. If you
-already did, double-check AWS_REGION (currently ${REGION}) matches the
-region you deployed into.
+The Ecr stack hasn't been deployed yet. For a clean repo, run
+\`./scripts/bootstrap.sh\` — it deploys the prerequisite stacks,
+pushes the initial images, then deploys Compute in the right order.
+
+If you've already deployed once, double-check AWS_REGION (currently
+${REGION}) matches the region you deployed into.
 EOF
     exit 1
+  fi
+
+  local push_only=0
+  if [[ -z "${cluster_name}" || -z "${service_name}" ]]; then
+    push_only=1
+    echo "    Cluster/service SSM params not yet present:"
+    echo "      cluster-name         = ${cluster_name:-<missing>}"
+    echo "      ${svc}/service-name  = ${service_name:-<missing>}"
+    echo "    Running in push-only mode (Compute stack not deployed yet)."
   fi
 
   local registry="${repo_uri%%/*}"
@@ -124,6 +139,16 @@ EOF
   echo "==> [${svc}] Pushing both tags..."
   docker push "${repo_uri}:${tag}"
   docker push "${repo_uri}:latest"
+
+  if [[ "${push_only}" == "1" ]]; then
+    echo
+    echo "[OK] ${svc} image pushed (push-only mode; no ECS rollout)."
+    echo "    image: ${repo_uri}:${tag}"
+    echo "    Run \`./scripts/bootstrap.sh\` (or finish the Compute stack"
+    echo "    deploy) to bring the service up against this image."
+    echo
+    return 0
+  fi
 
   echo "==> [${svc}] Triggering deployment of ${service_name}..."
   local current_desired

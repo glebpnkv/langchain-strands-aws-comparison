@@ -12,8 +12,9 @@
 #   - Resources outside the GlueAgent-* prefix.
 #   - CloudWatch log groups (they have their own retention; cheap to leave).
 #
-# Re-deploying after a teardown re-runs `cdk deploy` from `infra/` and
-# starts fresh. Phase 5's deploy scripts will rebuild and push images.
+# Re-deploying after a teardown is the same as a clean first deploy:
+# run `./scripts/bootstrap.sh`. It sequences the ECR-then-images-then-
+# Compute steps so CFN doesn't hang on the empty-ECR chicken-and-egg.
 
 set -euo pipefail
 
@@ -99,4 +100,6 @@ Worth a glance to be sure your bill stops:
   - CloudWatch log groups: don't cost much but linger; delete if pedantic
   - RDS automated/manual snapshots: only exist if you took them; check the RDS console
 
+When you're ready to redeploy, run ./scripts/bootstrap.sh — same flow
+as a clean first deploy.
 EOF

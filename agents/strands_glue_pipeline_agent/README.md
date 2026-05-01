@@ -201,26 +201,25 @@ The agent auto-loads every skill under `skills/`:
 
 ## Deploying to AWS
 
-Infrastructure lives under [`../../infra/`](../../infra/) (CDK Python). Application images are built and rolled out by [`../../scripts/deploy.sh`](../../scripts/deploy.sh). Teardown is a single script.
+Infrastructure lives under [`../../infra/`](../../infra/) (CDK Python). First-time bootstrap is [`../../scripts/bootstrap.sh`](../../scripts/bootstrap.sh); subsequent application image rollouts go through [`../../scripts/deploy.sh`](../../scripts/deploy.sh). Teardown is a single script.
 
 ### Architecture (deployed)
 
 ```
-Browser ─HTTPS─▶ ALB (Cognito auth)* ─▶ Chainlit ECS service ─▶ RDS Postgres
-                                              │
-                                              │  HTTP+SSE (X-Service-Auth)
-                                              ▼
-                                  Internal ALB ─▶ Agent ECS service ─▶ Bedrock / Athena / Glue / sandbox
+Browser ─HTTPS─▶ Public ALB (Cognito auth) ─▶ Chainlit ECS service ─▶ RDS Postgres
+                                                       │
+                                                       │  HTTP+SSE (X-Service-Auth)
+                                                       ▼
+                                          Internal ALB ─▶ Agent ECS service ─▶ Bedrock / Athena / Glue / sandbox
 ```
 
-\* Cognito auth lands with the SSO subsection below; until then, the frontend ALB is internal-only and reachable via SSM port-forward.
-
-Four CDK stacks, all named `GlueAgent-<Layer>-Dev`:
+Five CDK stacks, all named `GlueAgent-<Layer>-Dev`:
 
 - **Network** — VPC (10.0.0.0/16), 2 AZs, 1 NAT gateway, 5 security groups.
 - **Data** — RDS Postgres `db.t4g.micro`, single-AZ, 20 GB GP3, master credentials in Secrets Manager.
 - **Ecr** — two ECR repos (`glue-agent/agent`, `glue-agent/frontend`) with 10-image lifecycle policy.
-- **Compute** — Fargate cluster, agent + frontend task definitions / services, two internal ALBs, three SM secrets, IAM roles.
+- **Auth** — Cognito User Pool + User Pool Client + hosted-UI domain. Self-signup off; admins invite users via `admin-create-user`.
+- **Compute** — Fargate cluster, agent + frontend task definitions / services, the public HTTPS frontend ALB (Cognito-fronted) + internal HTTP agent ALB, ACM cert, Route 53 alias record, three SM secrets, IAM roles.
 
 Cost ballpark when fully deployed (idle): ~$80–100/mo.
 - NAT gateway $32 + RDS $13 + 2 ALBs $32 + storage/secrets $3.
@@ -238,24 +237,27 @@ cdk bootstrap aws://<account-id>/<region>
 
 ### First deploy — full sequence
 
+The first deploy uses `bootstrap.sh`, which sequences the chicken-and-egg between ECR (must exist before we can push images) and the Compute stack (creates ECS services that pull `:latest` and block CFN until the service stabilizes — which can't happen against an empty ECR).
+
 ```bash
 aws sso login
 
-# 1. Provision the infra. Network -> Data -> Ecr -> Compute, in dependency
-#    order. Both ECS services come up at desiredCount=0 (no images yet).
-cd infra && cdk deploy --all --require-approval never && cd -
+# 1. One command. Internally: cdk deploy Network/Data/Ecr/Auth ->
+#    docker build + push agent + frontend images -> cdk deploy
+#    Compute. Takes ~20-40 min on a clean account, dominated by RDS
+#    provisioning and ACM cert validation.
+./scripts/bootstrap.sh
 
 # 2. Populate the GitHub PAT secret (only needed once; re-run only on rotation).
 aws secretsmanager put-secret-value \
   --secret-id GlueAgent/Dev/GithubPat \
   --secret-string "<your-fine-grained-pat>"
 
-# 3. Build, push, and roll out the container images. The single
-#    deploy.sh takes which service to ship; `all` does both, agent
-#    first. It tags by short git SHA + :latest, pushes both tags, and
-#    bumps desiredCount from 0 to 1 on the first run.
-./scripts/deploy.sh all
+# 3. Add yourself (and any other stakeholders) as a Cognito user.
+#    See "Setting up a domain and SSO" below for invite/disable/reset.
 ```
+
+If `bootstrap.sh` fails partway through, just re-run it — each phase is idempotent (CDK stack ops are no-ops when nothing changed; image build+push is cheap with Docker layer cache).
 
 ### Subsequent deploys
 
@@ -269,24 +271,26 @@ Re-run the script targeting just what you changed:
 
 Each invocation rolls the service over to the new image with `--force-new-deployment` and waits for ECS to report it stable. Tag includes a `-dirty` suffix when the working tree has uncommitted changes, so a running task's tag is always traceable.
 
-### Reaching the deployed UI (until SSO lands)
+### Reaching the deployed UI
 
-Both ALBs are internal-scheme — no public DNS. Port-forward through a running Fargate task:
+After `cdk deploy --all` completes and the SSO setup (see below) has issued the cert + DNS, the chat lives at `https://<domain_name>`. Just visit the URL — Cognito's hosted login page intercepts unauthenticated visits, redirects authenticated ones back to Chainlit.
+
+For the **agent service** (internal ALB, no Cognito), if you ever need to hit `/healthz` or `/v1/chat` directly from your laptop for debugging, the SSM port-forward pattern still works:
 
 ```bash
 CLUSTER=$(aws ssm get-parameter --name /glue-agent/dev/cluster-name --query Parameter.Value --output text)
-FRONTEND_SVC=$(aws ssm get-parameter --name /glue-agent/dev/frontend/service-name --query Parameter.Value --output text)
-TASK_ARN=$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$FRONTEND_SVC" --query 'taskArns[0]' --output text)
+AGENT_SVC=$(aws ssm get-parameter --name /glue-agent/dev/agent/service-name --query Parameter.Value --output text)
+TASK_ARN=$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$AGENT_SVC" --query 'taskArns[0]' --output text)
 TASK_ID=$(echo "$TASK_ARN" | awk -F'/' '{print $NF}')
 RUNTIME_ID=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" --query 'tasks[0].containers[0].runtimeId' --output text)
 
 aws ssm start-session \
   --target "ecs:${CLUSTER}_${TASK_ID}_${RUNTIME_ID}" \
   --document-name AWS-StartPortForwardingSession \
-  --parameters '{"portNumber":["8000"],"localPortNumber":["8000"]}'
+  --parameters '{"portNumber":["8080"],"localPortNumber":["8080"]}'
 ```
 
-Open <http://localhost:8000> in your browser. Login is `admin / admin` (placeholder; replaced once Cognito is wired up — see SSO subsection below).
+Then `curl http://localhost:8080/healthz`.
 
 ### Tearing down
 
@@ -296,73 +300,96 @@ The deployed dev stack costs roughly $80–100/mo idle. When you're not actively
 ./scripts/teardown_dev_stack.sh
 ```
 
-Lists the live `GlueAgent-*-Dev` stacks, asks for `yes`, runs `cdk destroy --all --force`, and verifies nothing remains. RDS data and ECR images go with the stacks — fine for dev, not for prod. Re-deploying after a teardown is just `cdk deploy --all` followed by `./scripts/deploy.sh all`.
+Lists the live `GlueAgent-*-Dev` stacks, asks for `yes`, runs `cdk destroy --all --force`, and verifies nothing remains. RDS data and ECR images go with the stacks — fine for dev, not for prod. Re-deploying after a teardown is the same as a clean first deploy: `./scripts/bootstrap.sh`.
 
 ### Setting up a domain and SSO (Cognito + ALB)
 
-Cognito + ALB authentication requires HTTPS, which requires a domain you control. **Buy or bring your own domain first**, then the SSO CDK changes can wire it in.
+Cognito + ALB authentication requires HTTPS, which requires a domain you control. The CDK stacks expect a Route 53 **public hosted zone** for that domain (or a delegated subdomain) to already exist; once it does, everything else is provisioned automatically by `cdk deploy`.
 
-#### Option A: buy a fresh domain through Route 53
+#### Provisioning the hosted zone
 
-Cheapest end-to-end for a project that has none today. ~$13–30 for the first year depending on TLD.
+##### Option A: buy a fresh domain through Route 53
+
+Cheapest end-to-end if you have no domain today. ~$13–30 for the first year depending on TLD.
 
 1. AWS console → **Route 53** → **Registered domains** → **Register domain**.
-2. Search for an available name. `.com` is ~$13/year; `.io`, `.dev`, `.cloud` etc. vary.
-3. Fill in WHOIS contact info. Toggle **Privacy protection** (free, hides your details from public WHOIS).
-4. Pay. The registration is usually done in 5–10 minutes (occasionally up to a day for some TLDs).
-5. Route 53 automatically creates a **public hosted zone** for your new domain. That's the thing the CDK stack will plug into.
-6. Note the **hosted zone ID** (Route 53 → Hosted zones → click the zone → copy the `Z…` value at the top).
+2. Search for an available name (`.com` is ~$13/year).
+3. Fill in WHOIS contact info; toggle **Privacy protection** (free).
+4. Pay. Registration completes in 5–10 minutes for most TLDs.
+5. Route 53 auto-creates a public hosted zone for the domain.
+6. Note the hosted zone ID (Route 53 → Hosted zones → click zone → `Z…` value at the top).
 
-#### Option B: use a domain you already own (registered elsewhere)
+##### Option B: delegate a subdomain from an existing registrar
 
-You can keep the registrar but delegate DNS to Route 53. ~30 min of clicking + an hour of DNS propagation.
+If you already own a domain elsewhere (Squarespace, GoDaddy, Cloudflare, etc.) and only want to use a subdomain (e.g. `dataagent.<yourdomain>`) for the demo, delegate just that subdomain. Email and the apex stay where they are.
 
 1. AWS console → **Route 53** → **Hosted zones** → **Create hosted zone**.
-2. Domain name: the domain you already own (e.g. `example.com`) **or a subdomain** (e.g. `agent.example.com`) if you only want to delegate part of it. Type: **Public hosted zone**.
-3. Open the new zone. Note the four **NS records** at the top — you'll see something like `ns-1234.awsdns-12.org`, etc.
-4. Go to your existing registrar (GoDaddy, Cloudflare, Namecheap, etc.). For the domain (or subdomain), set the nameservers to the four `awsdns-*` values from step 3. The exact UI varies but every registrar has an "NS records" or "Nameservers" section.
-5. Wait for DNS to propagate. Quickest check:
-   ```bash
-   dig +short NS yourdomain.com
-   ```
-   Expect the four `awsdns-*` values to appear within 30–60 minutes (TTL-dependent; can be up to 48 hours in pathological cases).
-6. Note the hosted zone ID (`Z…`) — same place as Option A.
+2. Domain name: your chosen subdomain (e.g. `dataagent.example.com`). Type: **Public hosted zone**.
+3. Open the new zone. Note the four `awsdns-*` nameserver values.
+4. At your existing registrar, find the DNS records UI for the parent domain. Add four NS records:
+   - **Type**: `NS`
+   - **Name** (or "Host"): just the subdomain prefix (e.g. `dataagent`), not the full FQDN
+   - **Nameserver** (or "Data"): one `ns-XXXX.awsdns-XX.<tld>` value per record
+   - **TTL**: default
+5. Verify with `dig +short NS dataagent.example.com` — should return the four `awsdns-*` values within 30–60 min.
+6. Note the hosted zone ID (`Z…`).
 
-#### What CDK will do once SSO is added
+#### Pin the hosted zone in `cdk.json`
 
-The upcoming compute-stack changes consume the hosted zone ID via `--context hosted_zone_id=Z...` (or pinned in `cdk.json`):
+Open [`infra/cdk.json`](../../infra/cdk.json) and set:
 
-- Provision an **ACM certificate** for `chat.<yourdomain>` (or whatever subdomain you pick). ACM auto-validates by adding a DNS record to the hosted zone — no manual step.
-- Create a **Cognito User Pool** with self-signup disabled, email-as-username, email verification required. Plus a **User Pool Client** configured for the OAuth code-grant flow against the ALB.
-- Create a **Cognito hosted-UI domain** (defaults to a `*.auth.<region>.amazoncognito.com` prefix; can be a custom domain later).
-- Switch the frontend ALB from internet-facing-internal to **internet-facing with a HTTPS listener**, gated by a Cognito authenticate action on the listener rule.
-- Add a Route 53 **A record (alias)** pointing your subdomain at the ALB.
+```jsonc
+{
+  "context": {
+    ...
+    "hosted_zone_id": "Z01234567ABCDEFGH",
+    "domain_name": "dataagent.example.com"
+  }
+}
+```
 
-After deploy, your demo URL is `https://chat.<yourdomain>` and any visitor without a valid Cognito session is bounced to the Cognito hosted login page first.
+`domain_name` is the FQDN the chat UI lives at — typically the apex of your delegated zone, but can be a subdomain inside it (e.g. `chat.dataagent.example.com`) if you want.
+
+#### What `cdk deploy` does for SSO
+
+With those two values pinned, the next `cdk deploy --all` provisions:
+
+- **ACM certificate** for `domain_name`, DNS-validated against the hosted zone (CDK adds the validation records automatically; first deploy waits 5–30 min for ACM to issue).
+- **Cognito User Pool** (`GlueAgent-Auth-Dev`) with self-signup off, email username, email verification required, no MFA. Default Cognito sender for invitation emails.
+- **Cognito User Pool Client** registered with the ALB callback URL `https://<domain_name>/oauth2/idpresponse`.
+- **Cognito hosted UI domain** at `glueagent-dev-<account-id>.auth.<region>.amazoncognito.com`.
+- **Frontend ALB switched to internet-facing**, in public subnets. HTTPS listener on 443 with `authenticate-cognito` action, plain HTTP listener on 80 that 301-redirects to HTTPS.
+- **Route 53 A-record (alias)** pointing `domain_name` at the ALB.
+- **Frontend container env** gets `DEPLOYED_BEHIND_ALB=1`, which switches Chainlit's auth from `password_auth_callback` (admin/admin, local) to `header_auth_callback` (Cognito JWT in `x-amzn-oidc-data`, deployed).
+
+After deploy, the chat UI lives at `https://<domain_name>`. Anyone hitting it gets bounced to the Cognito hosted login page; only authenticated users reach Chainlit.
 
 #### Adding and removing demo users
-
-Once Cognito lands, here's the lifecycle (the same commands today against the not-yet-provisioned pool, will work as-is once the stack is deployed):
 
 ```bash
 # Look up the pool ID once
 POOL_ID=$(aws ssm get-parameter --name /glue-agent/dev/cognito/user-pool-id \
   --query Parameter.Value --output text)
 
-# Invite a stakeholder. They get an email with a temporary password.
+# Invite a stakeholder — they get an email with a temporary password.
 aws cognito-idp admin-create-user \
   --user-pool-id "$POOL_ID" \
   --username alice@example.com \
   --user-attributes Name=email,Value=alice@example.com Name=email_verified,Value=true \
   --desired-delivery-mediums EMAIL
+```
 
-# What happens next, on the user's side:
-#   1. Cognito emails them a temporary password.
-#   2. They visit https://chat.<yourdomain>, get redirected to Cognito login.
-#   3. They sign in with email + temp password.
-#   4. Cognito forces a password change on first login.
-#   5. They set a permanent password and reach the chat UI.
+What happens on the user's side:
 
+1. Cognito emails them a temporary password from `no-reply@verificationemail.com`. Tell them to expect it; the sender looks suspicious to a fresh inbox and may land in spam.
+2. They visit `https://<domain_name>`, get redirected to the Cognito hosted login page.
+3. They sign in with email + temp password.
+4. Cognito forces a password change on first login. They set a permanent password subject to the password policy (12 chars, mixed case, digits).
+5. Cognito redirects back to the ALB; the ALB sets a session cookie; Chainlit accepts the request and shows the chat UI.
+
+Other lifecycle commands:
+
+```bash
 # Disable a user (reversible — revokes access, keeps the account).
 aws cognito-idp admin-disable-user --user-pool-id "$POOL_ID" --username alice@example.com
 
@@ -375,9 +402,12 @@ aws cognito-idp admin-delete-user --user-pool-id "$POOL_ID" --username alice@exa
 # List all users in the pool.
 aws cognito-idp list-users --user-pool-id "$POOL_ID" \
   --query 'Users[].{email:Username,status:UserStatus,enabled:Enabled}' --output table
+
+# Force-reset a forgotten password — sends a fresh temporary password.
+aws cognito-idp admin-reset-user-password --user-pool-id "$POOL_ID" --username alice@example.com
 ```
 
-Cognito is free for the first 50,000 monthly active users, so for a stakeholder demo there's no per-user cost.
+Cognito is free for the first 50,000 monthly active users, so for a stakeholder demo there's no per-user cost. Adds ~$0.50/month for the Route 53 hosted zone (only cost beyond what's already in the deployed stack).
 
 ## Known limitations
 

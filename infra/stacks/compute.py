@@ -42,18 +42,28 @@ import json
 from pathlib import Path
 
 import aws_cdk as cdk
+from aws_cdk import aws_certificatemanager as acm
+from aws_cdk import aws_cognito as cognito
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_ecr as ecr
 from aws_cdk import aws_ecs as ecs
 from aws_cdk import aws_elasticloadbalancingv2 as elbv2
+from aws_cdk import aws_elasticloadbalancingv2_actions as elbv2_actions
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_logs as logs
 from aws_cdk import aws_rds as rds
+from aws_cdk import aws_route53 as route53
+from aws_cdk import aws_route53_targets as route53_targets
 from aws_cdk import aws_secretsmanager as secretsmanager
 from aws_cdk import aws_ssm as ssm
 from constructs import Construct
 
-from stacks.network import AGENT_HTTP_PORT, FRONTEND_HTTP_PORT  # noqa: F401  (reused symbols)
+from stacks.network import (  # noqa: F401  (reused symbols)
+    AGENT_HTTP_PORT,
+    ALB_HTTP_PORT,
+    ALB_HTTPS_PORT,
+    FRONTEND_HTTP_PORT,
+)
 
 # Path to the Glue/S3/Logs/PassRole policy doc lifted from the original
 # AgentCore deploy script. Authoritative source for the agent's deployed
@@ -83,6 +93,11 @@ class ComputeStack(cdk.Stack):
         frontend_repo: ecr.IRepository,
         db_instance: rds.IDatabaseInstance,
         db_secret: secretsmanager.ISecret,
+        hosted_zone: route53.IHostedZone,
+        domain_name: str,
+        user_pool: cognito.IUserPool,
+        user_pool_client: cognito.IUserPoolClient,
+        user_pool_domain: cognito.IUserPoolDomain,
         stage: str,
         **kwargs,
     ) -> None:
@@ -490,6 +505,10 @@ class ComputeStack(cdk.Stack):
                 # The schema-bootstrap entrypoint reads this and builds
                 # DATABASE_URL from the JSON-shaped DB secret.
                 "DB_SECRET_ARN": db_secret.secret_arn,
+                # Tells frontend/app.py to use header_auth_callback (read
+                # the Cognito JWT from x-amzn-oidc-data) instead of the
+                # local password_auth_callback (admin/admin).
+                "DEPLOYED_BEHIND_ALB": "1",
             },
             secrets={
                 "AGENT_SERVICE_AUTH_SECRET": ecs.Secret.from_secrets_manager(self.service_auth_secret),
@@ -497,22 +516,74 @@ class ComputeStack(cdk.Stack):
             },
         )
 
-        # --- Frontend internal ALB ----------------------------------------
+        # --- Frontend ALB (public, HTTPS, Cognito-fronted) ----------------
+        # Public-facing because Cognito's hosted UI redirects to the ALB
+        # over the public internet; an internal ALB couldn't receive the
+        # callback. SG (frontend_alb_sg) opens 443 + 80 to anywhere — the
+        # actual access control happens at the listener via
+        # authenticate-cognito.
         self.frontend_alb = elbv2.ApplicationLoadBalancer(
             self,
             "FrontendAlb",
             vpc=vpc,
-            internet_facing=False,
+            internet_facing=True,
             security_group=frontend_alb_sg,
-            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
             idle_timeout=cdk.Duration.seconds(120),
         )
 
-        frontend_listener = self.frontend_alb.add_listener(
-            "FrontendListener",
-            port=80,
+        # ACM cert for the FQDN, DNS-validated via the delegated Route 53
+        # zone. CDK auto-creates the validation CNAME records in the zone
+        # and waits for ACM to issue (5-30 min on first deploy).
+        self.frontend_certificate = acm.Certificate(
+            self,
+            "FrontendCertificate",
+            domain_name=domain_name,
+            validation=acm.CertificateValidation.from_dns(hosted_zone),
+        )
+
+        # Plain HTTP listener — only purpose is to permanent-redirect
+        # to HTTPS. Real traffic only ever uses 443.
+        self.frontend_alb.add_listener(
+            "FrontendHttpRedirect",
+            port=ALB_HTTP_PORT,
             protocol=elbv2.ApplicationProtocol.HTTP,
             open=False,
+            default_action=elbv2.ListenerAction.redirect(
+                protocol="HTTPS",
+                port=str(ALB_HTTPS_PORT),
+                permanent=True,
+            ),
+        )
+
+        # HTTPS listener with the authenticate-cognito action wrapping
+        # the forward to the frontend target group. Every request (other
+        # than the ALB's internal /oauth2/idpresponse callback path,
+        # which it handles automatically) must pass Cognito auth before
+        # reaching Chainlit. Target-group health checks come from the
+        # ALB internally and bypass listener actions, so /healthz works
+        # without auth.
+        frontend_listener = self.frontend_alb.add_listener(
+            "FrontendHttpsListener",
+            port=ALB_HTTPS_PORT,
+            protocol=elbv2.ApplicationProtocol.HTTPS,
+            open=False,
+            certificates=[
+                elbv2.ListenerCertificate.from_certificate_manager(self.frontend_certificate),
+            ],
+        )
+
+        # Route 53 alias record pointing the FQDN at the ALB. CDK creates
+        # an A-record-with-alias which is free (no DNS query charges
+        # for AWS-internal targets).
+        route53.ARecord(
+            self,
+            "FrontendAlias",
+            zone=hosted_zone,
+            record_name=domain_name,
+            target=route53.RecordTarget.from_alias(
+                route53_targets.LoadBalancerTarget(self.frontend_alb)
+            ),
         )
 
         # --- Frontend ECS service -----------------------------------------
@@ -538,10 +609,13 @@ class ComputeStack(cdk.Stack):
             enable_execute_command=True,
         )
 
-        frontend_listener.add_targets(
-            "FrontendTargets",
+        frontend_target_group = elbv2.ApplicationTargetGroup(
+            self,
+            "FrontendTargetGroup",
+            vpc=vpc,
             port=FRONTEND_HTTP_PORT,
             protocol=elbv2.ApplicationProtocol.HTTP,
+            target_type=elbv2.TargetType.IP,
             targets=[self.frontend_service],
             health_check=elbv2.HealthCheck(
                 # Chainlit's index page returns 200 for an authenticated
@@ -559,6 +633,24 @@ class ComputeStack(cdk.Stack):
             # must keep hitting the same task. LB-cookie stickiness for
             # an hour is plenty for any single chat session.
             stickiness_cookie_duration=cdk.Duration.hours(1),
+        )
+
+        # Wire the listener default action: authenticate via Cognito,
+        # then forward to the frontend target group. ALB handles the
+        # OAuth code-grant dance automatically using the user pool +
+        # client + domain.
+        frontend_listener.add_action(
+            "FrontendDefaultAction",
+            action=elbv2_actions.AuthenticateCognitoAction(
+                user_pool=user_pool,
+                user_pool_client=user_pool_client,
+                user_pool_domain=user_pool_domain,
+                next=elbv2.ListenerAction.forward([frontend_target_group]),
+                # Session lasts an hour — matches the access token TTL
+                # in the Cognito client. After that the user gets
+                # bounced back to Cognito for a fresh token.
+                session_timeout=cdk.Duration.hours(1),
+            ),
         )
 
         # --- Frontend SSM outputs ----------------------------------------
@@ -594,13 +686,10 @@ class ComputeStack(cdk.Stack):
         )
 
         # --- Top-level convenience output ---------------------------------
-        # The single most-asked-for value when checking "where's my UI?".
+        # Public HTTPS URL behind Cognito auth.
         cdk.CfnOutput(
             self,
             "FrontendUrl",
-            value=f"http://{self.frontend_alb.load_balancer_dns_name}",
-            description=(
-                "Internal frontend URL. Reach it via SSM port-forward; "
-                "see infra/README.md."
-            ),
+            value=f"https://{domain_name}",
+            description="Public chat UI; first-time users get bounced through Cognito's hosted login.",
         )

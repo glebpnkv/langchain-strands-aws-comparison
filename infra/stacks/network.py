@@ -25,11 +25,14 @@ from aws_cdk import aws_ec2 as ec2
 from constructs import Construct
 
 # Service ports — kept here so SGs and the compute stack agree.
-# The ALBs listen on 80 (standard HTTP) and forward to the container
-# ports below. SGs MUST gate the ALB ingress on the listener port (80),
-# not the container port — otherwise traffic that reaches the ALB is
-# silently dropped at the SG before the listener ever sees it.
+# The frontend ALB now serves the public on 443 (HTTPS, behind Cognito);
+# port 80 stays open only to redirect plain-HTTP visitors to HTTPS.
+# The agent ALB stays internal HTTP-only on 80. SGs MUST gate the ALB
+# ingress on the listener port (80 / 443), not the container port —
+# otherwise traffic that reaches the ALB is silently dropped at the SG
+# before the listener ever sees it.
 ALB_HTTP_PORT = 80
+ALB_HTTPS_PORT = 443
 FRONTEND_HTTP_PORT = 8000
 AGENT_HTTP_PORT = 8080
 POSTGRES_PORT = 5432
@@ -116,13 +119,19 @@ class NetworkStack(cdk.Stack):
         #   agent_alb_sg --[AGENT_HTTP_PORT=8080]--> agent_task_sg
         #   frontend_task_sg --[POSTGRES_PORT=5432]--> rds_sg
 
-        # User traffic into the frontend ALB on the ALB's listener port.
-        # The ALB itself is `internal` scheme so this is corp-VPN /
-        # SSM-port-forward reachable, not open to the public internet.
+        # The frontend ALB is now internet-facing (Cognito handles
+        # authentication on the listener) — open 443 to anywhere. Port
+        # 80 is open only so the ALB's HTTP listener can redirect to
+        # HTTPS; we never serve real content over plain HTTP.
         self.frontend_alb_sg.add_ingress_rule(
-            peer=ec2.Peer.ipv4(self.vpc.vpc_cidr_block),
+            peer=ec2.Peer.any_ipv4(),
+            connection=ec2.Port.tcp(ALB_HTTPS_PORT),
+            description="Public HTTPS to frontend ALB (auth via Cognito at the listener)",
+        )
+        self.frontend_alb_sg.add_ingress_rule(
+            peer=ec2.Peer.any_ipv4(),
             connection=ec2.Port.tcp(ALB_HTTP_PORT),
-            description="VPC clients to frontend ALB",
+            description="Public HTTP to frontend ALB (redirected to HTTPS)",
         )
 
         # ALB-to-task ingress is on the *container* port (frontend ALB

@@ -40,6 +40,7 @@ AGENT_BASE_URL = os.environ.get("AGENT_BASE_URL", "http://127.0.0.1:8080").rstri
 AGENT_SERVICE_AUTH_SECRET = os.environ.get("AGENT_SERVICE_AUTH_SECRET") or None
 REQUEST_TIMEOUT_SECONDS = float(os.environ.get("AGENT_REQUEST_TIMEOUT_SECONDS", "600"))
 DATABASE_URL = os.environ.get("DATABASE_URL") or None
+DEPLOYED_BEHIND_ALB = os.environ.get("DEPLOYED_BEHIND_ALB") == "1"
 
 
 # --- Persistence -----------------------------------------------------------
@@ -65,16 +66,71 @@ if DATABASE_URL:
 
 # --- Authentication --------------------------------------------------------
 #
-# Chainlit's data layer requires an authenticated user. For local dev we
-# accept a single hardcoded user (admin / admin) so threads have somewhere
-# to attach. Deployed environments swap this for header_auth_callback
-# reading the Cognito JWT injected by the ALB.
+# Two modes, switched by the DEPLOYED_BEHIND_ALB env var (set by the CDK
+# compute stack on the deployed task).
+#
+# Local dev (DEPLOYED_BEHIND_ALB unset): hardcoded admin/admin via
+# password_auth_callback. Lets `./scripts/run_local_stack.sh` work
+# without any auth infrastructure.
+#
+# Deployed (DEPLOYED_BEHIND_ALB=1): the ALB has already authenticated
+# the user via Cognito by the time the request reaches us, and forwards
+# the user's identity in a JWT in the `x-amzn-oidc-data` header. We
+# decode the JWT (no signature verification — see comment below) and
+# return a cl.User keyed on the user's email.
+#
+# Why we don't verify the JWT signature here: the ALB sets this header
+# AFTER it has already validated the user with Cognito, and the SG only
+# lets ALB traffic reach the frontend tasks (frontend_alb_sg ->
+# frontend_task_sg). So the JWT we receive has been validated upstream.
+# A defence-in-depth setup WOULD verify by fetching the public key
+# from `https://public-keys.auth.elb.<region>.amazonaws.com/<key-id>`
+# (the JWT header carries `kid`); add that if the security model
+# requires zero trust between ALB and tasks.
 
-@cl.password_auth_callback
-def auth_callback(username: str, password: str) -> cl.User | None:
-    if (username, password) == ("admin", "admin"):
-        return cl.User(identifier="admin", metadata={"role": "local-dev"})
-    return None
+if DEPLOYED_BEHIND_ALB:
+
+    @cl.header_auth_callback
+    def header_auth(headers: dict) -> cl.User | None:
+        # Header name is case-insensitive but Chainlit normalises to
+        # lower; accept either form to be robust to that contract
+        # changing.
+        oidc_data = headers.get("x-amzn-oidc-data") or headers.get("X-Amzn-Oidc-Data")
+        if not oidc_data:
+            log.warning("DEPLOYED_BEHIND_ALB=1 but no x-amzn-oidc-data header")
+            return None
+        try:
+            _hdr_b64, payload_b64, _sig_b64 = oidc_data.split(".")
+            # JWT base64url is unpadded — re-add padding to make
+            # urlsafe_b64decode happy.
+            payload_b64 += "=" * (-len(payload_b64) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        except Exception as e:
+            log.warning("failed to decode x-amzn-oidc-data: %s", e)
+            return None
+
+        email = payload.get("email")
+        sub = payload.get("sub")
+        if not email and not sub:
+            log.warning("x-amzn-oidc-data payload had neither email nor sub: %s", payload)
+            return None
+
+        return cl.User(
+            identifier=email or sub,
+            metadata={
+                "email": email,
+                "cognito_sub": sub,
+                "role": "deployed",
+            },
+        )
+
+else:
+
+    @cl.password_auth_callback
+    def password_auth(username: str, password: str) -> cl.User | None:
+        if (username, password) == ("admin", "admin"):
+            return cl.User(identifier="admin", metadata={"role": "local-dev"})
+        return None
 
 
 @cl.on_chat_start
