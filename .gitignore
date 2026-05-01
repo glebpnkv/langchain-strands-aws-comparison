@@ -215,3 +215,7 @@ runs/
 
 # macOS
 .DS_Store
+
+# CDK synth output
+infra/cdk.out/
+PLAN.md

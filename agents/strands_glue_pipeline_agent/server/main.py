@@ -27,6 +27,16 @@ from agent_server import (
 AGENT_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(AGENT_DIR / ".env")
 
+# When running inside an ECS task we want boto3 to authenticate via the
+# ECS container credential provider (= task role), NOT via a profile
+# from a config file that doesn't exist in the container. Strip any
+# inherited profile envs before any boto3 import path runs. Detection:
+# ECS_CONTAINER_METADATA_URI is set by Fargate / EC2 ECS only.
+if os.environ.get("ECS_CONTAINER_METADATA_URI") or os.environ.get("ECS_CONTAINER_METADATA_URI_V4"):
+    for _stale in ("AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_SDK_LOAD_CONFIG"):
+        if _stale in os.environ:
+            os.environ.pop(_stale, None)
+
 # `agent` is the sibling module agents/strands_glue_pipeline_agent/agent.py.
 # Importable because uvicorn is launched with --app-dir on this directory.
 from agent import make_agent, make_mcp_client  # noqa: E402

@@ -21,11 +21,20 @@ COPY pyproject.toml uv.lock /app/
 RUN uv sync --frozen --no-dev --no-install-project
 
 COPY frontend /app/frontend
+# Chainlit data layer schema — the entrypoint applies it idempotently
+# against the deployed RDS on every container start (CREATE / ALTER ...
+# IF NOT EXISTS, see scripts/local_stack/chainlit_schema.sql for the
+# full story). We copy the SQL into the image rather than fetching it
+# at runtime so a container in a private subnet without internet egress
+# still works.
+COPY scripts/local_stack/chainlit_schema.sql /app/chainlit_schema.sql
 
 EXPOSE 8000
 
+# entrypoint.py reads DB_SECRET_ARN from env, fetches DB credentials
+# from SM via boto3, applies the schema, then exec's chainlit. Local
+# dev (run_local_stack.sh) bypasses this entirely — it applies the
+# schema via psql before launching Chainlit directly. So the code path
+# in entrypoint.py only runs in the deployed container.
 CMD ["uv", "run", "--no-dev", "--frozen", \
-     "chainlit", "run", "/app/frontend/app.py", \
-     "--host", "0.0.0.0", \
-     "--port", "8000", \
-     "--headless"]
+     "python", "/app/frontend/entrypoint.py"]

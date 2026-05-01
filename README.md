@@ -118,6 +118,66 @@ script is overkill. Bring up only what you need:
 These omit Phoenix entirely — set `OTEL_EXPORTER_OTLP_ENDPOINT` and
 `AGENT_OTLP_ENABLE=1` yourself if you want OTLP export.
 
+### Deploying to ECS
+
+Infrastructure lives under [`infra/`](infra/) (CDK Python). Application
+images are built + pushed by `scripts/deploy_*.sh`.
+
+**One-time per AWS account + region** before the first deploy:
+
+```bash
+cd infra
+cdk bootstrap aws://<account-id>/<region>
+```
+
+(account-id from `aws sts get-caller-identity --query Account --output text`).
+This creates a small set of supporting resources CDK needs (S3 bucket for
+assets, IAM roles for deployments). Costs are ~$0/month idle.
+
+**First deploy** — full sequence:
+
+```bash
+aws sso login
+
+# 1. Provision the infra. Network -> Data -> Ecr -> Compute, in dependency
+#    order. Both ECS services come up at desiredCount=0 (no images yet).
+cd infra && cdk deploy --all && cd -
+
+# 2. Populate the GitHub PAT secret (only needed once; re-run only on rotation).
+aws secretsmanager put-secret-value \
+  --secret-id GlueAgent/Dev/GithubPat \
+  --secret-string "<your-fine-grained-pat>"
+
+# 3. Build, push, and roll out the container images. The single
+#    deploy.sh takes which service to ship; `all` does both, agent
+#    first. It tags by short git SHA + :latest, pushes both tags, and
+#    bumps desiredCount from 0 to 1 on the first run.
+./scripts/deploy.sh all
+```
+
+**Subsequent deploys** of code changes — re-run the script targeting
+just what you changed:
+
+```bash
+./scripts/deploy.sh agent       # only the agent FastAPI service
+./scripts/deploy.sh frontend    # only the Chainlit frontend
+./scripts/deploy.sh all         # both
+```
+
+Each invocation rolls the service over to the new image with
+`--force-new-deployment` and waits for ECS to report it stable. Tag
+includes a `-dirty` suffix when the working tree has uncommitted
+changes, so a running task's tag is always traceable.
+
+To stop paying for the deployed stack when you're not demoing:
+
+```bash
+./scripts/teardown_dev_stack.sh
+```
+
+See [`infra/README.md`](infra/README.md) for the full setup walkthrough,
+the cost ballpark per stack, and [PLAN.md](PLAN.md) for phase status.
+
 ### Known limitations (Phase 3b persistence)
 
 - **Resumed threads can't continue the conversation.** Refreshing the page or
