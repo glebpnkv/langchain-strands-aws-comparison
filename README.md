@@ -75,6 +75,17 @@ Optional: list Athena MCP tools before running:
 python agents/langchain-agent/main.py --list-tools
 ```
 
+## Running `strands_glue_pipeline_agent` (Chainlit chat frontend)
+
+The headliner agent has its own dedicated guide covering local development,
+the deployed AWS stack (CDK Python on ECS Fargate), Chainlit + Phoenix
+observability, and the Cognito SSO setup:
+
+**See [`agents/strands_glue_pipeline_agent/README.md`](agents/strands_glue_pipeline_agent/README.md).**
+
+This branch (`feature/chainlit-ui`) is active work-in-progress — see
+[PLAN.md](PLAN.md) for the phase roadmap and commit links.
+
 ## Exposing the Deployed AgentCore Runtime as an OpenAI-compatible API
 
 The local adapter wraps the deployed AgentCore runtime in an OpenAI-compatible HTTP API, usable from any OpenAI-style client (curl, Open WebUI, custom code, etc.).

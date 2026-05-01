@@ -21,10 +21,24 @@ dependencies = [
     "scikit-learn>=1.8.0",
     "strands-agents>=1.34.0",
     "strands-agents-tools>=0.2.21",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "sse-starlette>=2.1.0",
+    "httpx>=0.27.0",
+    "chainlit>=2.11.1",
+    "plotly>=6.7.0",
+    "openinference-instrumentation-bedrock>=0.1.35",
+    "asyncpg>=0.31.0",
+    "sqlalchemy>=2.0.49",
+    "greenlet>=3.5.0",
+    "awslabs-aws-dataprocessing-mcp-server>=0.1.29",
+    "awslabs-aws-api-mcp-server>=1.3.33",
 ]
 
 [dependency-groups]
 dev = [
+    "aws-cdk-lib>=2.251.0",
+    "constructs>=10.6.0",
     "pytest>=8.4.2",
     "ruff>=0.15.5",
 ]

@@ -123,24 +123,39 @@ def _build_mcp_env(profile: Optional[str], region: Optional[str]) -> dict[str, s
     """
     Build subprocess environment for the AWS MCP server.
 
-    :param profile: Optional AWS profile
-    :param region: Optional AWS region
-    :return: Environment dictionary for stdio MCP subprocess
+    Local dev (no ECS task metadata env): also propagates
+    AWS_SDK_LOAD_CONFIG=1 + AWS_EC2_METADATA_DISABLED=true onto the
+    parent's os.environ. AWS_SDK_LOAD_CONFIG=1 lets boto3 resolve SSO
+    credentials from `~/.aws/config`; without it some users' agents
+    couldn't find their `aws sso login` session. AWS_EC2_METADATA_DISABLED=true
+    avoids a multi-second IMDS lookup delay outside EC2.
+
+    Container (ECS task metadata env present): we DO NOT mutate
+    os.environ. AWS_SDK_LOAD_CONFIG=1 in a Fargate container with no
+    `~/.aws/config` makes any boto3 call that touches scoped config
+    fail with `ProfileNotFound: default`. Inside the container, the
+    task role + ECS container credential provider are how boto3 gets
+    credentials, no profile or config file involved.
+
+    The subprocess env (returned dict) gets the same AWS_* settings in
+    both cases — the MCP server is its own Python process and benefits
+    from the same SSO-friendly behavior locally; in the container
+    they're harmless because the subprocess inherits the same
+    credential chain as the parent.
     """
-    if region:
-        os.environ["AWS_DEFAULT_REGION"] = region
+    in_ecs = bool(
+        os.environ.get("ECS_CONTAINER_METADATA_URI")
+        or os.environ.get("ECS_CONTAINER_METADATA_URI_V4")
+    )
+    if not in_ecs:
+        os.environ.setdefault("AWS_SDK_LOAD_CONFIG", "1")
+        os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
+        os.environ.setdefault("AWS_STS_REGIONAL_ENDPOINTS", "regional")
 
-    # Important for SSO profiles (they live in ~/.aws/config, not ~/.aws/credentials).
-    os.environ.setdefault("AWS_SDK_LOAD_CONFIG", "1")
-    # Avoid unexpected credential-provider fallbacks / delays.
-    os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
-    # Safer for multi-region setups.
-    os.environ.setdefault("AWS_STS_REGIONAL_ENDPOINTS", "regional")
-
-    env = dict(os.environ)  # preserve PATH/HOME/etc.
-    env["AWS_SDK_LOAD_CONFIG"] = "1"
-    env["AWS_EC2_METADATA_DISABLED"] = "true"
-    env["AWS_STS_REGIONAL_ENDPOINTS"] = "regional"
+    env = dict(os.environ)  # preserves PATH/HOME/etc.
+    env.setdefault("AWS_SDK_LOAD_CONFIG", "1")
+    env.setdefault("AWS_EC2_METADATA_DISABLED", "true")
+    env.setdefault("AWS_STS_REGIONAL_ENDPOINTS", "regional")
     env["FASTMCP_LOG_LEVEL"] = "INFO"
     if profile:
         env["AWS_PROFILE"] = profile
